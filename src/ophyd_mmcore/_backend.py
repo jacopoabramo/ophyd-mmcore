@@ -19,24 +19,24 @@ if TYPE_CHECKING:
 
 
 class MMPropertyBackend(SignalBackend[PrimitiveT]):
-    """ophyd-async `SignalBackend` for a single Micro-Manager device property.
+    """ophyd-async ``SignalBackend`` for a single Micro-Manager device property.
 
     Micro-Manager properties are always one of ``str``, ``float``, or ``int``
-    (i.e. [`data`][ophyd_async.core.Primitive]), so this backend is typed over
-    `PrimitiveT` rather than the full `SignalDatatypeT`.
+    (i.e. :data:`~ophyd_async.core.Primitive`), so this backend is typed over
+    ``PrimitiveT`` rather than the full ``SignalDatatypeT``.
 
     Parameters
     ----------
-    device_label: str
-        The MM device label.
-    property_name: str
-        The MM property name.
-    worker: MMCoreWorker
-        The shared `MMCoreWorker`.  Inject one instance per application so
+    device_label:
+        The MM device label (e.g. ``"Camera"``).
+    property_name:
+        The MM property name (e.g. ``"Exposure"``).
+    worker:
+        The shared ``MMCoreWorker``.  Inject one instance per application so
         that all backends serialise through the same thread.
-    datatype: type[PrimitiveT] | None
-        The Python type for signal values.  Inferred from `PropertyType` if
-        not given (falls back to `str` for undefined properties).
+    datatype:
+        The Python type for signal values.  Inferred from ``PropertyType`` if
+        not given (falls back to ``str`` for undefined properties).
     """
 
     def __init__(
@@ -74,7 +74,7 @@ class MMPropertyBackend(SignalBackend[PrimitiveT]):
 
     async def connect(self, timeout: float) -> None:
         """Connect to the device property, verifying it is reachable."""
-        self._loop = asyncio.get_event_loop()
+        self._loop = asyncio.get_running_loop()
         await self._worker.run(
             lambda: self._worker.core.getProperty(self._dev, self._prop)
         )
@@ -112,21 +112,31 @@ class MMPropertyBackend(SignalBackend[PrimitiveT]):
     async def get_datakey(self, source: str) -> DataKey:
         """Return event-model DataKey metadata for this signal."""
         assert self.datatype is not None
-        value = await self.get_value()
-        core = self._worker.core
+        dev, prop = self._dev, self._prop
+
+        def _read_all() -> tuple[str, bool, float, float, tuple[str, ...]]:
+            core = self._worker.core
+            raw = core.getProperty(dev, prop)
+            has_limits = core.hasPropertyLimits(dev, prop)
+            lo = core.getPropertyLowerLimit(dev, prop) if has_limits else 0.0
+            hi = core.getPropertyUpperLimit(dev, prop) if has_limits else 0.0
+            allowed = core.getAllowedPropertyValues(dev, prop)
+            return raw, has_limits, lo, hi, allowed
+
+        raw, has_limits, lo, hi, allowed = await self._worker.run(_read_all)
+
+        value = cast("PrimitiveT", self.datatype(raw))
         metadata = make_metadata(self.datatype)
 
-        if core.hasPropertyLimits(self._dev, self._prop):
+        if has_limits:
             from event_model import Limits, LimitsRange
 
-            lo = core.getPropertyLowerLimit(self._dev, self._prop)
-            hi = core.getPropertyUpperLimit(self._dev, self._prop)
             metadata["limits"] = Limits(
                 control=LimitsRange(low=lo, high=hi),
                 display=LimitsRange(low=lo, high=hi),
             )
 
-        if allowed := core.getAllowedPropertyValues(self._dev, self._prop):
+        if allowed:
             metadata["choices"] = list(allowed)
 
         return make_datakey(self.datatype, value, source, metadata)
@@ -159,7 +169,7 @@ class MMPropertyBackend(SignalBackend[PrimitiveT]):
         datatype = self.datatype
         assert datatype is not None
 
-        def _on_property_changed(_dev: str, _prop: str, new_value: str) -> None:
+        def _on_property_changed(new_value: str) -> None:
             # Runs on the worker thread — marshal into the asyncio loop
             reading: Reading[PrimitiveT] = {
                 "value": cast("PrimitiveT", datatype(new_value)),

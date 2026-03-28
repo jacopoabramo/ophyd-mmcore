@@ -12,7 +12,8 @@ authors = [
 ]
 requires-python = ">=3.11"
 dependencies = [
-    "ophyd-async>=0.16",
+    "acquire-zarr>=0.7.0",
+    "ophyd-async>=0.17a2",
     "pymmcore-plus>=0.17.3",
 ]
 
@@ -30,6 +31,8 @@ include = [
 [dependency-groups]
 dev = [
     "pyright>=1.1.408",
+    "pytest>=9.0.2",
+    "pytest-asyncio>=1.3.0",
     "ruff>=0.15.4",
 ]
 
@@ -37,9 +40,12 @@ dev = [
 include = ["src/ophyd_mmcore"]
 pythonVersion = "3.11"
 typeCheckingMode = "standard"
+venvPath = "."
+venv = ".venv"
 
 [tool.ruff]
 fix = true
+exclude = ["tests"]
 
 [tool.ruff.lint]
 extend-select = [
@@ -55,3 +61,7 @@ docstring-code-format = true
 
 [tool.ruff.lint.pydocstyle]
 convention = "numpy"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
