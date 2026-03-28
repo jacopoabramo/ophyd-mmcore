@@ -329,27 +329,13 @@ class MMZarrDataLogic(DetectorDataLogic):
         dtype = np.dtype("uint8") if bpp == 1 else np.dtype("uint16")
         return w, h, dtype
 
-    def _drain_batch(self) -> tuple[int, bool]:
+    def _drain_batch(self) -> int:
         """Pop all available frames from the MM buffer into the zarr stream.
 
-        Returns ``(n_popped, still_running)``.  Runs on the worker thread.
+        Returns the number of frames popped.  Runs on the worker thread.
         """
         assert self._stream is not None, (
             "_drain_batch called before prepare_unbounded()"
-        )
-        n = self._worker.core.getRemainingImageCount()
-        for _ in range(n):
-            self._stream.append(self._worker.core.popNextImage())
-        running = self._worker.core.isSequenceRunning(self._mm_label)
-        return n, running
-
-    def _final_drain(self) -> int:
-        """Pop any frames that arrived after the sequence stopped.
-
-        Runs on the worker thread.
-        """
-        assert self._stream is not None, (
-            "_final_drain called before prepare_unbounded()"
         )
         n = self._worker.core.getRemainingImageCount()
         for _ in range(n):
@@ -359,8 +345,9 @@ class MMZarrDataLogic(DetectorDataLogic):
     async def _drain_loop(self) -> None:
         """Drain the MM circular buffer into the zarr stream continuously.
 
-        Polls every 10 ms.  Exits once the sequence stops and the buffer is
-        empty, then performs one final drain to catch any last frames.
+        Polls every 10 ms until cancelled by :meth:`stop`.  The loop starts
+        before the sequence acquisition is armed, so it must not exit on its
+        own — it runs until cancelled.
         """
         assert self._provider is not None, (
             "_drain_loop called before prepare_unbounded()"
@@ -368,20 +355,11 @@ class MMZarrDataLogic(DetectorDataLogic):
         frames_written = 0
 
         while True:
-            n, running = await self._worker.run(self._drain_batch)
+            n = await self._worker.run(self._drain_batch)
             if n > 0:
                 frames_written += n
                 await self._provider._frames_written.set(frames_written)
-            if not running:
-                break
             await asyncio.sleep(0.01)
-
-        # Final pass: catch frames that arrived between the last
-        # getRemainingImageCount() and isSequenceRunning() returning False.
-        n_final = await self._worker.run(self._final_drain)
-        if n_final > 0:
-            frames_written += n_final
-            await self._provider._frames_written.set(frames_written)
 
 
 class MMCamera(StandardDetector):
