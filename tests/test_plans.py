@@ -34,9 +34,10 @@ from ophyd_async.plan_stubs import ensure_connected
 
 from ophyd_async.testing import MovableBeamstop
 
-from ophyd_mmcore import MMCamera, MMDevice, PropName
+from pymmcore_plus import CMMCorePlus
+
+from ophyd_mmcore import MMCamera, MMDevice, PropName, get_worker
 from ophyd_mmcore._signal import mmcore_signal_rw
-from ophyd_mmcore._worker import MMCoreWorker
 
 
 # ---------------------------------------------------------------------------
@@ -48,13 +49,14 @@ class MMCameraImperative(MMDevice):
     """Camera defined the imperative way — signals constructed in __init__."""
 
     def __init__(
-        self, mm_label: str, worker: MMCoreWorker, name: str = ""
+        self, mm_label: str, core: CMMCorePlus, name: str = ""
     ) -> None:
+        worker = get_worker(core)
         with self.add_children_as_readables(Format.HINTED_SIGNAL):
             self.exposure = mmcore_signal_rw(float, mm_label, "Exposure", worker)
         with self.add_children_as_readables(Format.CONFIG_SIGNAL):
             self.binning = mmcore_signal_rw(str, mm_label, "Binning", worker)
-        super().__init__(mm_label, worker, name=name)
+        super().__init__(mm_label, core, name=name)
 
 
 class MMCameraDeclarative(MMDevice):
@@ -87,11 +89,11 @@ def RE() -> Generator[RunEngine, None, None]:
 
 
 @pytest.fixture(params=["imperative", "declarative"])
-def cam(request: pytest.FixtureRequest, worker: MMCoreWorker) -> MMDevice:
+def cam(request: pytest.FixtureRequest, core: CMMCorePlus) -> MMDevice:
     """Both camera styles, exercised by every plan test via parametrize."""
     if request.param == "imperative":
-        return MMCameraImperative("Camera", worker, name="cam")
-    return MMCameraDeclarative("Camera", worker, name="cam")
+        return MMCameraImperative("Camera", core, name="cam")
+    return MMCameraDeclarative("Camera", core, name="cam")
 
 
 
@@ -109,7 +111,7 @@ def test_read_single_signal_with_rd(RE: RunEngine, cam: MMDevice) -> None:
 
 
 def test_set_signal_with_mv(
-    RE: RunEngine, cam: MMDevice, worker: MMCoreWorker
+    RE: RunEngine, cam: MMDevice, core: CMMCorePlus
 ) -> None:
     """bps.mv sets a signal value inside a plan."""
     def plan() -> Generator[Any, Any, None]:
@@ -117,7 +119,7 @@ def test_set_signal_with_mv(
         yield from bps.mv(cam.exposure, 50.0)  # type: ignore[attr-defined]
 
     RE(plan())
-    assert float(worker.core.getProperty("Camera", "Exposure")) == pytest.approx(50.0)
+    assert float(core.getProperty("Camera", "Exposure")) == pytest.approx(50.0)
 
 
 def test_count_plan_reads_camera(RE: RunEngine, cam: MMDevice) -> None:
@@ -180,8 +182,8 @@ def test_read_configuration(RE: RunEngine, cam: MMDevice) -> None:
 
 
 @pytest.fixture
-def fly_cam(worker: MMCoreWorker, tmp_path: Path) -> MMCamera:
-    return MMCamera("Camera", worker, tmp_path / "fly.zarr", name="flycam")
+def fly_cam(core: CMMCorePlus, tmp_path: Path) -> MMCamera:
+    return MMCamera("Camera", core, tmp_path / "fly.zarr", name="flycam")
 
 
 def _fly_plan(
@@ -221,7 +223,7 @@ def test_fly_plan_produces_stream_documents(
 
 
 def test_mixed_device_with_non_mm_child(
-    RE: RunEngine, worker: MMCoreWorker
+    RE: RunEngine, core: CMMCorePlus
 ) -> None:
     """An MMDevice subclass can carry a non-MM child device as a sibling.
 
@@ -233,11 +235,11 @@ def test_mixed_device_with_non_mm_child(
     class CameraWithBeamstop(MMDevice):
         exposure: A[SignalRW[float], PropName("Exposure"), Format.HINTED_SIGNAL]
 
-        def __init__(self, mm_label: str, worker: MMCoreWorker, name: str = "") -> None:
+        def __init__(self, mm_label: str, core: CMMCorePlus, name: str = "") -> None:
             self.beamstop = MovableBeamstop()
-            super().__init__(mm_label, worker, name=name)
+            super().__init__(mm_label, core, name=name)
 
-    device = CameraWithBeamstop("Camera", worker, name="cam")
+    device = CameraWithBeamstop("Camera", core, name="cam")
 
     results: list[Any] = []
 

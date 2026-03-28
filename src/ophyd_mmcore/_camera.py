@@ -15,6 +15,7 @@ from ophyd_async.core import (
     soft_signal_rw,
 )
 
+from ._base import get_worker
 from ._connector import MMDeviceConnector
 
 if TYPE_CHECKING:
@@ -22,6 +23,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from bluesky.protocols import StreamAsset
+    from pymmcore_plus import CMMCorePlus
 
     from ._worker import MMCoreWorker
 
@@ -54,11 +56,11 @@ def _zarr_dtype(dtype: np.dtype) -> zarr.DataType:
 
 
 # ---------------------------------------------------------------------------
-# MMZarrStore
+# ZarrStore
 # ---------------------------------------------------------------------------
 
 
-class MMZarrStore:
+class ZarrStore:
     """Shared acquire-zarr store that multiple data logics write into.
 
     Each :class:`MMZarrDataLogic` registers its array dimensions here during
@@ -207,7 +209,7 @@ class MMArmLogic(DetectorArmLogic):
         The associated :class:`MMTriggerLogic`; the arm logic reads
         ``_n_frames`` from it.
     store:
-        The shared :class:`MMZarrStore`; opened here on the first arm so
+        The shared :class:`ZarrStore`; opened here on the first arm so
         all data logics have registered their arrays before the stream starts.
     """
 
@@ -216,7 +218,7 @@ class MMArmLogic(DetectorArmLogic):
         mm_label: str,
         worker: MMCoreWorker,
         trigger_logic: MMTriggerLogic,
-        store: MMZarrStore,
+        store: ZarrStore,
     ) -> None:
         self._mm_label = mm_label
         self._worker = worker
@@ -257,7 +259,7 @@ class MMArmLogic(DetectorArmLogic):
 
 
 class MMZarrStreamProvider(StreamableDataProvider):
-    """StreamableDataProvider for an array within a shared :class:`MMZarrStore`.
+    """StreamableDataProvider for an array within a shared :class:`ZarrStore`.
 
     Holds a soft signal that the drain loop updates with the running frame
     count.  The detector framework reads this signal to track progress and
@@ -281,7 +283,7 @@ class MMZarrStreamProvider(StreamableDataProvider):
 
     def __init__(
         self,
-        store: MMZarrStore,
+        store: ZarrStore,
         array_key: str,
         datakey_name: str,
         dtype: np.dtype,
@@ -339,12 +341,12 @@ class MMZarrStreamProvider(StreamableDataProvider):
 
 
 class MMZarrDataLogic(DetectorDataLogic):
-    """DetectorDataLogic that streams MM frames into a shared :class:`MMZarrStore`.
+    """DetectorDataLogic that streams MM frames into a shared :class:`ZarrStore`.
 
-    Multiple ``MMZarrDataLogic`` instances can share one ``MMZarrStore``,
+    Multiple ``MMZarrDataLogic`` instances can share one ``ZarrStore``,
     each writing to a different array key within the same zarr store on disk.
     Frames are drained from the MM circular buffer by a background asyncio
-    task and handed to the store via :meth:`MMZarrStore.append`.
+    task and handed to the store via :meth:`ZarrStore.append`.
 
     The drain task runs from ``prepare_unbounded`` until cancelled by
     :meth:`stop`.  The store itself is opened by :class:`MMArmLogic` once all
@@ -353,7 +355,7 @@ class MMZarrDataLogic(DetectorDataLogic):
     Parameters
     ----------
     store:
-        The shared :class:`MMZarrStore` to write into.
+        The shared :class:`ZarrStore` to write into.
     array_key:
         Output key for this logic's array within the store.
     mm_label:
@@ -368,7 +370,7 @@ class MMZarrDataLogic(DetectorDataLogic):
 
     def __init__(
         self,
-        store: MMZarrStore,
+        store: ZarrStore,
         array_key: str,
         mm_label: str,
         worker: MMCoreWorker,
@@ -492,10 +494,10 @@ class MMCamera(StandardDetector):
     step scans (via ``trigger()``) and fly scans (via ``prepare()`` /
     ``kickoff()`` / ``complete()``).
 
-    An :class:`MMZarrStore` is created internally and shared between the arm
+    An :class:`ZarrStore` is created internally and shared between the arm
     logic (which opens the stream) and the data logic (which registers its
     array and drains frames into it).  To share a store across multiple
-    cameras, create an ``MMZarrStore`` explicitly and pass it via
+    cameras, create an ``ZarrStore`` explicitly and pass it via
     ``store``.
 
     Property signals (exposure, binning, etc.) are declared on subclasses
@@ -531,7 +533,7 @@ class MMCamera(StandardDetector):
         Filesystem path for the output ``.zarr`` store.  Ignored when
         ``store`` is provided.
     store:
-        Optional pre-created :class:`MMZarrStore`.  When given,
+        Optional pre-created :class:`ZarrStore`.  When given,
         ``store_path`` is not used.  Useful for sharing one zarr store
         across multiple cameras.
     array_key:
@@ -546,18 +548,19 @@ class MMCamera(StandardDetector):
     def __init__(
         self,
         mm_label: str,
-        worker: MMCoreWorker,
+        core: CMMCorePlus,
         store_path: Path | None = None,
         *,
-        store: MMZarrStore | None = None,
+        store: ZarrStore | None = None,
         array_key: str = "frames",
         chunk_t: int = 1,
         name: str = "",
     ) -> None:
+        worker = get_worker(core)
         if store is None:
             if store_path is None:
                 raise ValueError("Either store_path or store must be provided.")
-            store = MMZarrStore(store_path)
+            store = ZarrStore(store_path)
         trigger_logic = MMTriggerLogic(mm_label, worker)
         arm_logic = MMArmLogic(mm_label, worker, trigger_logic, store)
         data_logic = MMZarrDataLogic(store, array_key, mm_label, worker, chunk_t)

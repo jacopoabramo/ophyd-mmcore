@@ -4,24 +4,39 @@ from __future__ import annotations
 
 from importlib.metadata import version
 
+from ._base import MMDevice, get_worker
 from ._camera import (
     MMArmLogic,
     MMCamera,
     MMTriggerLogic,
     MMZarrDataLogic,
-    MMZarrStore,
     MMZarrStreamProvider,
+    ZarrStore,
 )
-from ._connector import PropName
-from ._device import MMDevice
-from ._devices import MMAutoFocus, MMGalvo, MMPump, MMShutter, MMStateDevice
+from ._connector import (
+    CoreMethod,
+    ExposureMethod,
+    PropName,
+    ShutterOpenMethod,
+    XPositionMethod,
+    YPositionMethod,
+    ZPositionMethod,
+)
+from ._devices import (
+    MMAutoFocus,
+    MMGalvo,
+    MMPump,
+    MMShutter,
+    MMStateDevice,
+    MMXYStage,
+    MMZStage,
+)
 from ._signal import (
     mmcore_signal_auto,
     mmcore_signal_r,
     mmcore_signal_rw,
     mmcore_signal_w,
 )
-from ._stage import MMXYStage, MMZStage
 from ._worker import MMCoreWorker
 
 try:
@@ -31,13 +46,20 @@ except Exception:
 
 __all__ = [
     "MMCoreWorker",
+    "get_worker",
+    "CoreMethod",
+    "ExposureMethod",
+    "ZPositionMethod",
+    "XPositionMethod",
+    "YPositionMethod",
+    "ShutterOpenMethod",
     "PropName",
     "MMDevice",
     "MMCamera",
     "MMTriggerLogic",
     "MMArmLogic",
     "MMZarrDataLogic",
-    "MMZarrStore",
+    "ZarrStore",
     "MMZarrStreamProvider",
     "MMShutter",
     "MMStateDevice",

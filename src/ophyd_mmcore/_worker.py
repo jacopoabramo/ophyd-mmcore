@@ -5,16 +5,19 @@ from concurrent.futures import Future
 from dataclasses import dataclass
 from queue import SimpleQueue
 from threading import Thread
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pymmcore_plus import CMMCorePlus
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 @dataclass
 class _WorkItem:
     """A unit of work submitted to the MMCoreWorker queue."""
 
-    fn: Any  # Callable[[], Any] — kept as Any to avoid generic variance issues
+    fn: Callable[[], Any]
     fut: Future[Any]
 
 
@@ -38,7 +41,7 @@ class MMCoreWorker:
 
     def __init__(self, core: CMMCorePlus | None = None) -> None:
         self._core = core or CMMCorePlus.instance()
-        self._queue: SimpleQueue[_WorkItem | _Sentinel] = SimpleQueue()
+        self._queue = SimpleQueue[_WorkItem | _Sentinel]()
         self._thread = Thread(
             target=self._run_loop,
             name="MMCoreWorker",
@@ -51,17 +54,17 @@ class MMCoreWorker:
         """The wrapped CMMCorePlus instance (read-only reference)."""
         return self._core
 
-    def submit(self, fn: Any) -> Future[Any]:
+    def submit(self, fn: Callable[[], Any]) -> Future[Any]:
         """Schedule *fn* on the worker thread and return a Future for its result.
 
         The returned ``concurrent.futures.Future`` can be awaited inside an
         asyncio coroutine via ``await asyncio.wrap_future(fut)``.
         """
-        fut: Future[Any] = Future()
+        fut = Future[Any]()
         self._queue.put(_WorkItem(fn=fn, fut=fut))
         return fut
 
-    async def run(self, fn: Any) -> Any:
+    async def run(self, fn: Callable[[], Any]) -> Any:
         """Submit *fn* to the worker thread and await its result."""
         return await asyncio.wrap_future(self.submit(fn))
 

@@ -10,15 +10,14 @@ Each mixin gets a fixture with a patched CMMCorePlus and tests covering:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from collections.abc import Generator
-from typing import Annotated as A
 from typing import Any
+from unittest.mock import patch
 
 import pytest
-from ophyd_async.core import StandardReadableFormat as Format
 from ophyd_async.core import WatcherUpdate
 from pymmcore_plus import CMMCorePlus
-from unittest.mock import patch
 
 
 from ophyd_mmcore._devices import (
@@ -28,15 +27,12 @@ from ophyd_mmcore._devices import (
     MMShutter,
     MMStateDevice,
 )
-from ophyd_mmcore._worker import MMCoreWorker
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-
-import contextlib
 
 def _base_patches(instance: CMMCorePlus):
     """Return an ExitStack with all property-level MM patches applied."""
@@ -82,40 +78,31 @@ def core_shutter() -> Generator[CMMCorePlus, None, None]:
         yield instance
 
 
-@pytest.fixture
-def worker_shutter(core_shutter: CMMCorePlus) -> Generator[MMCoreWorker, None, None]:
-    w = MMCoreWorker(core_shutter)
-    yield w
-    w.stop()
-
-
-async def test_shutter_locate(worker_shutter: MMCoreWorker) -> None:
-    s = MyShutter("Shutter", worker_shutter, name="shutter")
+async def test_shutter_locate(core_shutter: CMMCorePlus) -> None:
+    s = MyShutter("Shutter", core_shutter, name="shutter")
     await s.connect(mock=False)
     loc = await s.locate()
     assert loc["readback"] is False
 
 
-async def test_shutter_set_opens(worker_shutter: MMCoreWorker, core_shutter: CMMCorePlus) -> None:
-    s = MyShutter("Shutter", worker_shutter, name="shutter")
+async def test_shutter_set_opens(core_shutter: CMMCorePlus) -> None:
+    s = MyShutter("Shutter", core_shutter, name="shutter")
     await s.connect(mock=False)
     await s.set(True)
     core_shutter.setShutterOpen.assert_called_with("Shutter", True)  # type: ignore[attr-defined]
 
 
-async def test_shutter_locate_reflects_set(worker_shutter: MMCoreWorker) -> None:
-    s = MyShutter("Shutter", worker_shutter, name="shutter")
+async def test_shutter_locate_reflects_set(core_shutter: CMMCorePlus) -> None:
+    s = MyShutter("Shutter", core_shutter, name="shutter")
     await s.connect(mock=False)
     await s.set(True)
     loc = await s.locate()
     assert loc["readback"] is True
 
 
-async def test_shutter_emits_watcher_updates(
-    worker_shutter: MMCoreWorker, core_shutter: CMMCorePlus
-) -> None:
+async def test_shutter_emits_watcher_updates(core_shutter: CMMCorePlus) -> None:
     core_shutter.deviceBusy.side_effect = [True, False]  # type: ignore[attr-defined]
-    s = MyShutter("Shutter", worker_shutter, name="shutter")
+    s = MyShutter("Shutter", core_shutter, name="shutter")
     await s.connect(mock=False)
     updates, collect = _watcher_collector()
     status = s.set(True)
@@ -125,10 +112,9 @@ async def test_shutter_emits_watcher_updates(
     assert updates[-1].target is True
 
 
-async def test_shutter_stop(worker_shutter: MMCoreWorker) -> None:
-    core_shutter = worker_shutter.core
+async def test_shutter_stop(core_shutter: CMMCorePlus) -> None:
     core_shutter.deviceBusy.side_effect = lambda lbl: True  # type: ignore[attr-defined]
-    s = MyShutter("Shutter", worker_shutter, name="shutter")
+    s = MyShutter("Shutter", core_shutter, name="shutter")
     await s.connect(mock=False)
     move = s.set(True)
     await asyncio.sleep(0.02)
@@ -158,40 +144,31 @@ def core_state() -> Generator[CMMCorePlus, None, None]:
         yield instance
 
 
-@pytest.fixture
-def worker_state(core_state: CMMCorePlus) -> Generator[MMCoreWorker, None, None]:
-    w = MMCoreWorker(core_state)
-    yield w
-    w.stop()
-
-
-async def test_state_locate(worker_state: MMCoreWorker) -> None:
-    fw = MyFilterWheel("FilterWheel", worker_state, name="fw")
+async def test_state_locate(core_state: CMMCorePlus) -> None:
+    fw = MyFilterWheel("FilterWheel", core_state, name="fw")
     await fw.connect(mock=False)
     loc = await fw.locate()
     assert loc["readback"] == "DAPI"
 
 
-async def test_state_set(worker_state: MMCoreWorker, core_state: CMMCorePlus) -> None:
-    fw = MyFilterWheel("FilterWheel", worker_state, name="fw")
+async def test_state_set(core_state: CMMCorePlus) -> None:
+    fw = MyFilterWheel("FilterWheel", core_state, name="fw")
     await fw.connect(mock=False)
     await fw.set("FITC")
     core_state.setStateLabel.assert_called_with("FilterWheel", "FITC")  # type: ignore[attr-defined]
 
 
-async def test_state_locate_reflects_set(worker_state: MMCoreWorker) -> None:
-    fw = MyFilterWheel("FilterWheel", worker_state, name="fw")
+async def test_state_locate_reflects_set(core_state: CMMCorePlus) -> None:
+    fw = MyFilterWheel("FilterWheel", core_state, name="fw")
     await fw.connect(mock=False)
     await fw.set("FITC")
     loc = await fw.locate()
     assert loc["readback"] == "FITC"
 
 
-async def test_state_emits_watcher_updates(
-    worker_state: MMCoreWorker, core_state: CMMCorePlus
-) -> None:
+async def test_state_emits_watcher_updates(core_state: CMMCorePlus) -> None:
     core_state.deviceBusy.side_effect = [True, False]  # type: ignore[attr-defined]
-    fw = MyFilterWheel("FilterWheel", worker_state, name="fw")
+    fw = MyFilterWheel("FilterWheel", core_state, name="fw")
     await fw.connect(mock=False)
     updates, collect = _watcher_collector()
     status = fw.set("FITC")
@@ -201,9 +178,9 @@ async def test_state_emits_watcher_updates(
     assert updates[-1].target == "FITC"
 
 
-async def test_state_stop(worker_state: MMCoreWorker, core_state: CMMCorePlus) -> None:
+async def test_state_stop(core_state: CMMCorePlus) -> None:
     core_state.deviceBusy.side_effect = lambda lbl: True  # type: ignore[attr-defined]
-    fw = MyFilterWheel("FilterWheel", worker_state, name="fw")
+    fw = MyFilterWheel("FilterWheel", core_state, name="fw")
     await fw.connect(mock=False)
     move = fw.set("FITC")
     await asyncio.sleep(0.02)
@@ -234,47 +211,40 @@ def core_af() -> Generator[CMMCorePlus, None, None]:
         yield instance
 
 
-@pytest.fixture
-def worker_af(core_af: CMMCorePlus) -> Generator[MMCoreWorker, None, None]:
-    w = MMCoreWorker(core_af)
-    yield w
-    w.stop()
-
-
-async def test_af_locate(worker_af: MMCoreWorker) -> None:
-    af = MyAutoFocus("AutoFocus", worker_af, name="af")
+async def test_af_locate(core_af: CMMCorePlus) -> None:
+    af = MyAutoFocus("AutoFocus", core_af, name="af")
     await af.connect(mock=False)
     loc = await af.locate()
     assert loc["readback"] == pytest.approx(0.0)
 
 
-async def test_af_set_offset(worker_af: MMCoreWorker, core_af: CMMCorePlus) -> None:
-    af = MyAutoFocus("AutoFocus", worker_af, name="af")
+async def test_af_set_offset(core_af: CMMCorePlus) -> None:
+    af = MyAutoFocus("AutoFocus", core_af, name="af")
     await af.connect(mock=False)
     await af.set(10.0)
     core_af.setAutoFocusOffset.assert_called_with(10.0)  # type: ignore[attr-defined]
 
 
-async def test_af_locate_reflects_set(worker_af: MMCoreWorker) -> None:
-    af = MyAutoFocus("AutoFocus", worker_af, name="af")
+async def test_af_locate_reflects_set(core_af: CMMCorePlus) -> None:
+    af = MyAutoFocus("AutoFocus", core_af, name="af")
     await af.connect(mock=False)
     await af.set(10.0)
     loc = await af.locate()
     assert loc["readback"] == pytest.approx(10.0)
 
 
-async def test_af_trigger_calls_full_focus(worker_af: MMCoreWorker, core_af: CMMCorePlus) -> None:
+async def test_af_trigger_calls_full_focus(core_af: CMMCorePlus) -> None:
     # Make isContinuousFocusLocked return True on second call so trigger exits
     core_af.isContinuousFocusLocked.side_effect = [False, True]  # type: ignore[attr-defined]
-    af = MyAutoFocus("AutoFocus", worker_af, name="af")
+    af = MyAutoFocus("AutoFocus", core_af, name="af")
     await af.connect(mock=False)
     await af.trigger()
     core_af.fullFocus.assert_called_once()  # type: ignore[attr-defined]
 
 
-async def test_af_stop(worker_af: MMCoreWorker, core_af: CMMCorePlus) -> None:
+async def test_af_stop(core_af: CMMCorePlus) -> None:
     core_af.deviceBusy.side_effect = lambda lbl: True  # type: ignore[attr-defined]
-    af = MyAutoFocus("AutoFocus", worker_af, name="af")
+    af = MyAutoFocus("AutoFocus", core_af, name="af")
     await af.connect(mock=False)
     move = af.set(50.0)
     await asyncio.sleep(0.02)
@@ -305,37 +275,30 @@ def core_galvo() -> Generator[CMMCorePlus, None, None]:
         yield instance
 
 
-@pytest.fixture
-def worker_galvo(core_galvo: CMMCorePlus) -> Generator[MMCoreWorker, None, None]:
-    w = MMCoreWorker(core_galvo)
-    yield w
-    w.stop()
-
-
-async def test_galvo_locate(worker_galvo: MMCoreWorker) -> None:
-    g = MyGalvo("Galvo", worker_galvo, name="galvo")
+async def test_galvo_locate(core_galvo: CMMCorePlus) -> None:
+    g = MyGalvo("Galvo", core_galvo, name="galvo")
     await g.connect(mock=False)
     loc = await g.locate()
     assert loc["readback"] == (pytest.approx(0.0), pytest.approx(0.0))
 
 
-async def test_galvo_set(worker_galvo: MMCoreWorker, core_galvo: CMMCorePlus) -> None:
-    g = MyGalvo("Galvo", worker_galvo, name="galvo")
+async def test_galvo_set(core_galvo: CMMCorePlus) -> None:
+    g = MyGalvo("Galvo", core_galvo, name="galvo")
     await g.connect(mock=False)
     await g.set((100.0, 200.0))
     core_galvo.setGalvoPosition.assert_called_with("Galvo", 100.0, 200.0)  # type: ignore[attr-defined]
 
 
-async def test_galvo_locate_reflects_set(worker_galvo: MMCoreWorker) -> None:
-    g = MyGalvo("Galvo", worker_galvo, name="galvo")
+async def test_galvo_locate_reflects_set(core_galvo: CMMCorePlus) -> None:
+    g = MyGalvo("Galvo", core_galvo, name="galvo")
     await g.connect(mock=False)
     await g.set((100.0, 200.0))
     loc = await g.locate()
     assert loc["readback"] == (pytest.approx(100.0), pytest.approx(200.0))
 
 
-async def test_galvo_trigger_fires(worker_galvo: MMCoreWorker, core_galvo: CMMCorePlus) -> None:
-    g = MyGalvo("Galvo", worker_galvo, name="galvo")
+async def test_galvo_trigger_fires(core_galvo: CMMCorePlus) -> None:
+    g = MyGalvo("Galvo", core_galvo, name="galvo")
     await g.connect(mock=False)
     await g.set((50.0, 75.0))
     await g.trigger()
@@ -363,25 +326,16 @@ def core_pump() -> Generator[CMMCorePlus, None, None]:
         yield instance
 
 
-@pytest.fixture
-def worker_pump(core_pump: CMMCorePlus) -> Generator[MMCoreWorker, None, None]:
-    w = MMCoreWorker(core_pump)
-    yield w
-    w.stop()
-
-
-async def test_pump_set_dispenses(worker_pump: MMCoreWorker, core_pump: CMMCorePlus) -> None:
-    p = MyPump("Pump", worker_pump, name="pump")
+async def test_pump_set_dispenses(core_pump: CMMCorePlus) -> None:
+    p = MyPump("Pump", core_pump, name="pump")
     await p.connect(mock=False)
     await p.set(50.0)
     core_pump.pumpDispenseVolumeUl.assert_called_with("Pump", 50.0)  # type: ignore[attr-defined]
 
 
-async def test_pump_emits_watcher_updates(
-    worker_pump: MMCoreWorker, core_pump: CMMCorePlus
-) -> None:
+async def test_pump_emits_watcher_updates(core_pump: CMMCorePlus) -> None:
     core_pump.deviceBusy.side_effect = [True, False]  # type: ignore[attr-defined]
-    p = MyPump("Pump", worker_pump, name="pump")
+    p = MyPump("Pump", core_pump, name="pump")
     await p.connect(mock=False)
     updates, collect = _watcher_collector()
     status = p.set(50.0)
@@ -391,9 +345,9 @@ async def test_pump_emits_watcher_updates(
     assert updates[-1].target == pytest.approx(50.0)
 
 
-async def test_pump_stop(worker_pump: MMCoreWorker, core_pump: CMMCorePlus) -> None:
+async def test_pump_stop(core_pump: CMMCorePlus) -> None:
     core_pump.deviceBusy.side_effect = lambda lbl: True  # type: ignore[attr-defined]
-    p = MyPump("Pump", worker_pump, name="pump")
+    p = MyPump("Pump", core_pump, name="pump")
     await p.connect(mock=False)
     dispense = p.set(100.0)
     await asyncio.sleep(0.02)

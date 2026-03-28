@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from bluesky.protocols import Reading
     from event_model import DataKey
     from ophyd_async.core import Callback
+    from pymmcore_plus import CMMCorePlus
 
     from ._worker import MMCoreWorker
 
@@ -62,7 +63,31 @@ class MMPropertyBackend(SignalBackend[PrimitiveT]):
         # We need the event loop when wiring callbacks; captured on connect()
         self._loop: asyncio.AbstractEventLoop | None = None
 
+        self._getter: Callable[[CMMCorePlus, str], Any] | None = None
+        self._setter: Callable[[CMMCorePlus, str, Any], None] | None = None
+        self._event_prop: str = self._prop
+        self._event_factory: Callable[[CMMCorePlus], Any] | None = None
+        self._event_value: Callable[..., Any] | None = None
+
         super().__init__(datatype)
+
+    def configure_prop(self, name: str) -> None:
+        """Configure the backend to use the generic property API for *name*."""
+        self._prop = name
+        self._event_prop = name
+
+    def configure_core_method(
+        self,
+        getter: Callable[[CMMCorePlus, str], Any],
+        setter: Callable[[CMMCorePlus, str, Any], None] | None,
+        event_factory: Callable[[CMMCorePlus], Any] | None,
+        event_value: Callable[..., Any] | None = None,
+    ) -> None:
+        """Configure the backend to use dedicated core API methods."""
+        self._getter = getter
+        self._setter = setter
+        self._event_factory = event_factory
+        self._event_value = event_value
 
     def source(self, name: str, read: bool) -> str:
         """Return the source URI for this signal."""
@@ -71,26 +96,34 @@ class MMPropertyBackend(SignalBackend[PrimitiveT]):
     async def connect(self, timeout: float) -> None:
         """Connect to the device property, verifying it is reachable."""
         self._loop = asyncio.get_running_loop()
-        await self._worker.run(
-            lambda: self._worker.core.getProperty(self._dev, self._prop)
-        )
+        if (getter := self._getter) is not None:
+            await self._worker.run(lambda: getter(self._worker.core, self._dev))
+        else:
+            await self._worker.run(
+                lambda: self._worker.core.getProperty(self._dev, self._prop)
+            )
 
     async def put(self, value: PrimitiveT | None) -> None:
         """Write *value* to the MM property."""
-        # setProperty accepts bool | float | int | str — PrimitiveT satisfies this
-        await self._worker.run(
-            lambda: self._worker.core.setProperty(
-                self._dev, self._prop, cast("Primitive", value)
+        if (setter := self._setter) is not None:
+            await self._worker.run(lambda: setter(self._worker.core, self._dev, value))
+        else:
+            await self._worker.run(
+                lambda: self._worker.core.setProperty(
+                    self._dev, self._prop, cast("Primitive", value)
+                )
             )
-        )
 
     async def get_value(self) -> PrimitiveT:
         """Return the current property value cast to the declared datatype."""
         assert self.datatype is not None
-        raw: str = await self._worker.run(
+        if (getter := self._getter) is not None:
+            raw = await self._worker.run(lambda: getter(self._worker.core, self._dev))
+            return cast("PrimitiveT", self.datatype(raw))
+        raw_str: str = await self._worker.run(
             lambda: self._worker.core.getProperty(self._dev, self._prop)
         )
-        return cast("PrimitiveT", self.datatype(raw))
+        return cast("PrimitiveT", self.datatype(raw_str))
 
     async def get_setpoint(self) -> PrimitiveT:
         """Return the setpoint (same as readback for MM properties)."""
@@ -147,8 +180,12 @@ class MMPropertyBackend(SignalBackend[PrimitiveT]):
 
         # Always disconnect the existing slot first
         if self._psygnal_slot is not None:
-            prop_sig = core.events.devicePropertyChanged(self._dev, self._prop)
-            prop_sig.disconnect(self._psygnal_slot)
+            if self._event_factory is not None:
+                self._event_factory(core).disconnect(self._psygnal_slot)
+            elif self._event_prop:
+                core.events.devicePropertyChanged(
+                    self._dev, self._event_prop
+                ).disconnect(self._psygnal_slot)
             self._psygnal_slot = None
         self._reading_callback = None
 
@@ -164,35 +201,61 @@ class MMPropertyBackend(SignalBackend[PrimitiveT]):
 
         datatype = self.datatype
         assert datatype is not None
+        label = self._dev
 
-        def _on_property_changed(new_value: str) -> None:
-            # Runs on the worker thread — marshal into the asyncio loop
-            reading: Reading[PrimitiveT] = {
-                "value": cast("PrimitiveT", datatype(new_value)),
-                "timestamp": time.time(),
-                "alarm_severity": 0,
-            }
-            loop.call_soon_threadsafe(cast("Any", callback), reading)
+        if self._event_factory is not None:
+            # CoreMethod path: signal emits (label, *args) — filter by label,
+            # then extract the value via event_value (if given) or first arg.
+            event_value_fn = self._event_value
 
-        prop_sig = core.events.devicePropertyChanged(self._dev, self._prop)
-        prop_sig.connect(_on_property_changed)
-        self._psygnal_slot = _on_property_changed
+            def _on_method_event(event_label: str, *args: Any) -> None:
+                if event_label != label:
+                    return
+                raw = event_value_fn(*args) if event_value_fn is not None else args[0]
+                reading: Reading[PrimitiveT] = {
+                    "value": cast("PrimitiveT", datatype(raw)),
+                    "timestamp": time.time(),
+                    "alarm_severity": 0,
+                }
+                loop.call_soon_threadsafe(cast("Any", callback), reading)
+
+            self._event_factory(core).connect(_on_method_event)
+            self._psygnal_slot = _on_method_event
+        elif self._event_prop:
+            # PropName path: devicePropertyChanged emits (device, prop, value)
+            def _on_property_changed(new_value: str) -> None:
+                reading = {
+                    "value": cast("PrimitiveT", datatype(new_value)),
+                    "timestamp": time.time(),
+                    "alarm_severity": 0,
+                }
+                loop.call_soon_threadsafe(cast("Any", callback), reading)
+
+            core.events.devicePropertyChanged(self._dev, self._event_prop).connect(
+                _on_property_changed
+            )
+            self._psygnal_slot = _on_property_changed
+
         self._reading_callback = callback
+
+        getter = self._getter
+
+        def _deliver_initial() -> None:
+            if getter is not None:
+                raw = getter(core, self._dev)
+                value = cast("PrimitiveT", datatype(raw))
+            else:
+                value = cast(
+                    "PrimitiveT", datatype(core.getProperty(self._dev, self._prop))
+                )
+            loop.call_soon_threadsafe(
+                cast("Any", callback),
+                {"value": value, "timestamp": time.time(), "alarm_severity": 0},
+            )
 
         # Immediately deliver the current value so the subscriber is
         # synchronised on registration (matches SoftSignalBackend behaviour)
-        self.submit(
-            lambda: loop.call_soon_threadsafe(
-                cast("Any", callback),
-                {
-                    "value": cast(
-                        "PrimitiveT", datatype(core.getProperty(self._dev, self._prop))
-                    ),
-                    "timestamp": time.time(),
-                    "alarm_severity": 0,
-                },
-            )
-        )
+        self.submit(_deliver_initial)
 
     def submit(self, fn: Callable[[], Any]) -> Future[Any]:
         """Direct access to the worker queue (for subclasses or tests)."""

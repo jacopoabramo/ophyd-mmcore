@@ -7,6 +7,8 @@ from typing import Iterator
 import pytest
 from pymmcore_plus import CMMCorePlus
 
+from ophyd_mmcore import get_worker
+from ophyd_mmcore._base import _worker_cache
 from ophyd_mmcore._worker import MMCoreWorker
 
 
@@ -20,7 +22,15 @@ def core() -> Iterator[CMMCorePlus]:
 
 @pytest.fixture
 def worker(core: CMMCorePlus) -> Iterator[MMCoreWorker]:
-    """Yield an MMCoreWorker wrapping the demo core."""
-    w = MMCoreWorker(core)
+    """Yield the shared MMCoreWorker for the demo core."""
+    w = get_worker(core)
     yield w
-    w.stop()
+
+
+@pytest.fixture(autouse=True)
+def _cleanup_workers() -> Iterator[None]:
+    """Stop and evict all cached workers after each test."""
+    yield
+    for w in list(_worker_cache.values()):
+        w.stop()
+    _worker_cache.clear()
