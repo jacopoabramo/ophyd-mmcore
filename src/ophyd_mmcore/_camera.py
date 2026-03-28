@@ -322,10 +322,9 @@ class MMZarrDataLogic(DetectorDataLogic):
 
     def _get_frame_shape(self) -> tuple[int, int, np.dtype]:
         """Read frame dimensions from MM; runs on the worker thread."""
-        core = self._worker.core
-        w = core.getImageWidth()
-        h = core.getImageHeight()
-        bpp = core.getBytesPerPixel()
+        w = self._worker.core.getImageWidth()
+        h = self._worker.core.getImageHeight()
+        bpp = self._worker.core.getBytesPerPixel()
         dtype = np.dtype("uint8") if bpp == 1 else np.dtype("uint16")
         return w, h, dtype
 
