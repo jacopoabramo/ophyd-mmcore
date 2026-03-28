@@ -11,11 +11,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import acquire_zarr as zarr
 import pytest
 from ophyd_async.core import TriggerInfo
 from pymmcore_plus import CMMCorePlus
 
-from ophyd_mmcore._camera import MMArmLogic, MMCamera, MMTriggerLogic, MMZarrDataLogic
+from ophyd_mmcore._camera import MMArmLogic, MMCamera, MMTriggerLogic, MMZarrDataLogic, MMZarrStore
 from ophyd_mmcore._worker import MMCoreWorker
 
 
@@ -65,27 +66,43 @@ async def test_trigger_logic_skips_exposure_when_zero(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_arm_starts_sequence(
-    worker: MMCoreWorker, core: CMMCorePlus
-) -> None:
+@pytest.fixture
+def arm_logic(worker: MMCoreWorker, store_path: Path) -> MMArmLogic:
+    """MMArmLogic wired to a store with one dummy array registered."""
+    store = MMZarrStore(store_path)
+    # Register a minimal array so the store can open successfully.
+    store.register_array(
+        "frames",
+        zarr.ArraySettings(
+            output_key="frames",
+            data_type=zarr.DataType.UINT16,
+            dimensions=[
+                zarr.Dimension(name="t", kind=zarr.DimensionType.TIME, array_size_px=0, chunk_size_px=1, shard_size_chunks=1),
+                zarr.Dimension(name="y", kind=zarr.DimensionType.SPACE, array_size_px=512, chunk_size_px=512, shard_size_chunks=1),
+                zarr.Dimension(name="x", kind=zarr.DimensionType.SPACE, array_size_px=512, chunk_size_px=512, shard_size_chunks=1),
+            ],
+        ),
+    )
     trigger = MMTriggerLogic("Camera", worker)
     trigger._n_frames = 10
-    arm = MMArmLogic("Camera", worker, trigger)
-    await arm.arm()
+    return MMArmLogic("Camera", worker, trigger, store)
+
+
+@pytest.mark.asyncio
+async def test_arm_starts_sequence(
+    arm_logic: MMArmLogic, core: CMMCorePlus
+) -> None:
+    await arm_logic.arm()
     assert core.isSequenceRunning("Camera")
-    await arm.disarm()
+    await arm_logic.disarm()
 
 
 @pytest.mark.asyncio
 async def test_disarm_stops_sequence(
-    worker: MMCoreWorker, core: CMMCorePlus
+    arm_logic: MMArmLogic, core: CMMCorePlus
 ) -> None:
-    trigger = MMTriggerLogic("Camera", worker)
-    trigger._n_frames = 10
-    arm = MMArmLogic("Camera", worker, trigger)
-    await arm.arm()
-    await arm.disarm()
+    await arm_logic.arm()
+    await arm_logic.disarm()
     assert not core.isSequenceRunning("Camera")
 
 
@@ -98,17 +115,21 @@ async def test_disarm_stops_sequence(
 async def test_zarr_data_logic_creates_store(
     worker: MMCoreWorker, store_path: Path
 ) -> None:
-    logic = MMZarrDataLogic(store_path, "Camera", worker)
+    store = MMZarrStore(store_path)
+    logic = MMZarrDataLogic(store, "frames", "Camera", worker)
     await logic.prepare_unbounded("cam")
+    store.open()
     assert store_path.exists()
     await logic.stop()
+    store.close()
 
 
 @pytest.mark.asyncio
 async def test_zarr_data_logic_stop_is_idempotent(
     worker: MMCoreWorker, store_path: Path
 ) -> None:
-    logic = MMZarrDataLogic(store_path, "Camera", worker)
+    store = MMZarrStore(store_path)
+    logic = MMZarrDataLogic(store, "frames", "Camera", worker)
     await logic.prepare_unbounded("cam")
     await logic.stop()
     await logic.stop()  # must not raise

@@ -9,6 +9,7 @@ from ._camera import (
     MMCamera,
     MMTriggerLogic,
     MMZarrDataLogic,
+    MMZarrStore,
     MMZarrStreamProvider,
 )
 from ._connector import PropName
@@ -36,6 +37,7 @@ __all__ = [
     "MMTriggerLogic",
     "MMArmLogic",
     "MMZarrDataLogic",
+    "MMZarrStore",
     "MMZarrStreamProvider",
     "MMShutter",
     "MMStateDevice",

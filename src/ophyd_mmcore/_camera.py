@@ -26,6 +26,10 @@ if TYPE_CHECKING:
     from ._worker import MMCoreWorker
 
 
+# ---------------------------------------------------------------------------
+# dtype mapping
+# ---------------------------------------------------------------------------
+
 _NP_TO_ZARR: dict[np.dtype, zarr.DataType] = {
     np.dtype("uint8"): zarr.DataType.UINT8,
     np.dtype("uint16"): zarr.DataType.UINT16,
@@ -47,6 +51,104 @@ def _zarr_dtype(dtype: np.dtype) -> zarr.DataType:
         raise ValueError(
             f"No acquire-zarr DataType for numpy dtype {dtype!r}"
         ) from None
+
+
+# ---------------------------------------------------------------------------
+# MMZarrStore
+# ---------------------------------------------------------------------------
+
+
+class MMZarrStore:
+    """Shared acquire-zarr store that multiple data logics write into.
+
+    Each :class:`MMZarrDataLogic` registers its array dimensions here during
+    ``prepare_unbounded``.  The underlying ``ZarrStream`` is opened lazily on
+    the first call to :meth:`open` — subsequent calls from other logics are
+    no-ops.  This mirrors the pattern used in *redsun*'s ``ZarrWriter``.
+
+    Closing the store (via :meth:`close`) resets it so it can be reused for
+    the next acquisition.
+
+    Parameters
+    ----------
+    store_path:
+        Filesystem path for the ``.zarr`` store directory.
+    overwrite:
+        Whether to overwrite an existing store at the same path.
+    """
+
+    def __init__(self, store_path: Path, *, overwrite: bool = True) -> None:
+        self._store_path = store_path
+        self._overwrite = overwrite
+        self._array_settings: dict[str, zarr.ArraySettings] = {}
+        self._stream: zarr.ZarrStream | None = None
+
+    @property
+    def store_uri(self) -> str:
+        return f"file://{self._store_path.resolve()}"
+
+    @property
+    def is_open(self) -> bool:
+        return self._stream is not None
+
+    def register_array(self, key: str, settings: zarr.ArraySettings) -> None:
+        """Register an array to be created when the stream opens.
+
+        Must be called before :meth:`open`.
+
+        Parameters
+        ----------
+        key:
+            Output key / array name within the zarr store.
+        settings:
+            acquire-zarr ``ArraySettings`` describing dtype and dimensions.
+        """
+        if self.is_open:
+            raise RuntimeError(
+                "Cannot register arrays after the store has been opened."
+            )
+        self._array_settings[key] = settings
+
+    def open(self) -> None:
+        """Open the ZarrStream with all registered arrays.
+
+        Idempotent — subsequent calls are no-ops.
+        """
+        if self.is_open:
+            return
+        self._stream = zarr.ZarrStream(
+            zarr.StreamSettings(
+                store_path=str(self._store_path),
+                arrays=list(self._array_settings.values()),
+                overwrite=self._overwrite,
+            )
+        )
+
+    def append(self, frame: np.ndarray, key: str) -> None:
+        """Append *frame* to the array identified by *key*.
+
+        Parameters
+        ----------
+        frame:
+            NumPy array representing a single frame.
+        key:
+            Output key of the target array (must match a registered key).
+        """
+        if self._stream is None:
+            raise RuntimeError("Store is not open; call open() first.")
+        self._stream.append(frame, key=key)
+
+    def close(self) -> None:
+        """Close the ZarrStream and reset registered arrays."""
+        if self._stream is not None:
+            self._stream.close()
+            self._stream = None
+        self._array_settings.clear()
+
+
+# ---------------------------------------------------------------------------
+# MMTriggerLogic
+# ---------------------------------------------------------------------------
 
 
 class MMTriggerLogic(DetectorTriggerLogic):
@@ -85,6 +187,11 @@ class MMTriggerLogic(DetectorTriggerLogic):
             )
 
 
+# ---------------------------------------------------------------------------
+# MMArmLogic
+# ---------------------------------------------------------------------------
+
+
 class MMArmLogic(DetectorArmLogic):
     """DetectorArmLogic for a pymmcore-plus camera device.
 
@@ -99,6 +206,9 @@ class MMArmLogic(DetectorArmLogic):
     trigger_logic:
         The associated :class:`MMTriggerLogic`; the arm logic reads
         ``_n_frames`` from it.
+    store:
+        The shared :class:`MMZarrStore`; opened here on the first arm so
+        all data logics have registered their arrays before the stream starts.
     """
 
     def __init__(
@@ -106,13 +216,16 @@ class MMArmLogic(DetectorArmLogic):
         mm_label: str,
         worker: MMCoreWorker,
         trigger_logic: MMTriggerLogic,
+        store: MMZarrStore,
     ) -> None:
         self._mm_label = mm_label
         self._worker = worker
         self._trigger_logic = trigger_logic
+        self._store = store
 
     async def arm(self) -> None:
-        """Start MM sequence acquisition."""
+        """Open the zarr store (if not already open) then start MM sequence acquisition."""
+        self._store.open()
         n = self._trigger_logic._n_frames
         await self._worker.run(
             lambda: self._worker.core.startSequenceAcquisition(
@@ -128,17 +241,23 @@ class MMArmLogic(DetectorArmLogic):
             await asyncio.sleep(0.02)
 
     async def disarm(self) -> None:
-        """Stop sequence acquisition if still running."""
+        """Stop sequence acquisition and close the zarr store."""
         if await self._worker.run(
             lambda: self._worker.core.isSequenceRunning(self._mm_label)
         ):
             await self._worker.run(
                 lambda: self._worker.core.stopSequenceAcquisition(self._mm_label)
             )
+        self._store.close()
+
+
+# ---------------------------------------------------------------------------
+# MMZarrStreamProvider
+# ---------------------------------------------------------------------------
 
 
 class MMZarrStreamProvider(StreamableDataProvider):
-    """StreamableDataProvider for a zarr store written by acquire-zarr.
+    """StreamableDataProvider for an array within a shared :class:`MMZarrStore`.
 
     Holds a soft signal that the drain loop updates with the running frame
     count.  The detector framework reads this signal to track progress and
@@ -146,8 +265,8 @@ class MMZarrStreamProvider(StreamableDataProvider):
 
     Parameters
     ----------
-    store_uri:
-        ``file://`` URI to the zarr store root.
+    store:
+        The shared zarr store.
     array_key:
         Key of the array within the zarr store.
     datakey_name:
@@ -162,7 +281,7 @@ class MMZarrStreamProvider(StreamableDataProvider):
 
     def __init__(
         self,
-        store_uri: str,
+        store: MMZarrStore,
         array_key: str,
         datakey_name: str,
         dtype: np.dtype,
@@ -179,7 +298,7 @@ class MMZarrStreamProvider(StreamableDataProvider):
 
         self._bundle = ComposeStreamResource()(
             mimetype="application/x-zarr",
-            uri=store_uri,
+            uri=store.store_uri,
             data_key=datakey_name,
             parameters={"path": array_key},
             uid=None,
@@ -220,84 +339,90 @@ class MMZarrStreamProvider(StreamableDataProvider):
 
 
 class MMZarrDataLogic(DetectorDataLogic):
-    """DetectorDataLogic that streams MM frames into an OME-Zarr store.
+    """DetectorDataLogic that streams MM frames into a shared :class:`MMZarrStore`.
 
+    Multiple ``MMZarrDataLogic`` instances can share one ``MMZarrStore``,
+    each writing to a different array key within the same zarr store on disk.
     Frames are drained from the MM circular buffer by a background asyncio
-    task and handed to an *acquire-zarr* ``ZarrStream``.  The drain task
-    starts when :meth:`prepare_unbounded` is called and terminates after
-    the sequence acquisition stops and all remaining frames are flushed.
+    task and handed to the store via :meth:`MMZarrStore.append`.
+
+    The drain task runs from ``prepare_unbounded`` until cancelled by
+    :meth:`stop`.  The store itself is opened by :class:`MMArmLogic` once all
+    data logics have registered their arrays.
 
     Parameters
     ----------
-    store_path:
-        Filesystem path for the output ``.zarr`` store directory.
+    store:
+        The shared :class:`MMZarrStore` to write into.
+    array_key:
+        Output key for this logic's array within the store.
     mm_label:
         Micro-Manager device label for the camera.
     worker:
         The shared ``MMCoreWorker``.
+    chunk_t:
+        Number of frames per time-axis chunk.  Defaults to 1 (one frame per
+        chunk), which minimises write latency.  Larger values improve read
+        throughput at the cost of buffering.
     """
-
-    _ARRAY_KEY = "frames"
 
     def __init__(
         self,
-        store_path: Path,
+        store: MMZarrStore,
+        array_key: str,
         mm_label: str,
         worker: MMCoreWorker,
+        chunk_t: int = 1,
     ) -> None:
-        self._store_path = store_path
+        self._store = store
+        self._array_key = array_key
         self._mm_label = mm_label
         self._worker = worker
+        self._chunk_t = chunk_t
 
-        self._stream: zarr.ZarrStream | None = None
         self._provider: MMZarrStreamProvider | None = None
         self._drain_task: asyncio.Task[None] | None = None
 
     async def prepare_unbounded(self, datakey_name: str) -> MMZarrStreamProvider:
-        """Open the zarr store and return the stream provider."""
+        """Register this logic's array with the store and start the drain loop."""
         await self.stop()
 
         width, height, dtype = await self._worker.run(self._get_frame_shape)
 
-        self._stream = zarr.ZarrStream(
-            zarr.StreamSettings(
-                store_path=str(self._store_path),
-                arrays=[
-                    zarr.ArraySettings(
-                        output_key=self._ARRAY_KEY,
-                        data_type=_zarr_dtype(dtype),
-                        dimensions=[
-                            zarr.Dimension(
-                                name="t",
-                                kind=zarr.DimensionType.TIME,
-                                array_size_px=0,  # unlimited / streaming
-                                chunk_size_px=1,
-                                shard_size_chunks=1,
-                            ),
-                            zarr.Dimension(
-                                name="y",
-                                kind=zarr.DimensionType.SPACE,
-                                array_size_px=height,
-                                chunk_size_px=height,
-                                shard_size_chunks=1,
-                            ),
-                            zarr.Dimension(
-                                name="x",
-                                kind=zarr.DimensionType.SPACE,
-                                array_size_px=width,
-                                chunk_size_px=width,
-                                shard_size_chunks=1,
-                            ),
-                        ],
-                    )
+        self._store.register_array(
+            self._array_key,
+            zarr.ArraySettings(
+                output_key=self._array_key,
+                data_type=_zarr_dtype(dtype),
+                dimensions=[
+                    zarr.Dimension(
+                        name="t",
+                        kind=zarr.DimensionType.TIME,
+                        array_size_px=0,  # unlimited / streaming
+                        chunk_size_px=self._chunk_t,
+                        shard_size_chunks=1,
+                    ),
+                    zarr.Dimension(
+                        name="y",
+                        kind=zarr.DimensionType.SPACE,
+                        array_size_px=height,
+                        chunk_size_px=height,
+                        shard_size_chunks=1,
+                    ),
+                    zarr.Dimension(
+                        name="x",
+                        kind=zarr.DimensionType.SPACE,
+                        array_size_px=width,
+                        chunk_size_px=width,
+                        shard_size_chunks=1,
+                    ),
                 ],
-                overwrite=True,
-            )
+            ),
         )
 
         self._provider = MMZarrStreamProvider(
-            store_uri=f"file://{self._store_path.resolve()}",
-            array_key=self._ARRAY_KEY,
+            store=self._store,
+            array_key=self._array_key,
             datakey_name=datakey_name,
             dtype=dtype,
             width=width,
@@ -307,7 +432,7 @@ class MMZarrDataLogic(DetectorDataLogic):
         return self._provider
 
     async def stop(self) -> None:
-        """Cancel the drain task and close the zarr stream."""
+        """Cancel the drain task."""
         if self._drain_task is not None and not self._drain_task.done():
             self._drain_task.cancel()
             try:
@@ -315,10 +440,6 @@ class MMZarrDataLogic(DetectorDataLogic):
             except asyncio.CancelledError:
                 pass
         self._drain_task = None
-
-        if self._stream is not None:
-            self._stream.close()
-            self._stream = None
 
     def _get_frame_shape(self) -> tuple[int, int, np.dtype]:
         """Read frame dimensions from MM; runs on the worker thread."""
@@ -329,20 +450,17 @@ class MMZarrDataLogic(DetectorDataLogic):
         return w, h, dtype
 
     def _drain_batch(self) -> int:
-        """Pop all available frames from the MM buffer into the zarr stream.
+        """Pop all available frames from the MM buffer into the store.
 
         Returns the number of frames popped.  Runs on the worker thread.
         """
-        assert self._stream is not None, (
-            "_drain_batch called before prepare_unbounded()"
-        )
         n = self._worker.core.getRemainingImageCount()
         for _ in range(n):
-            self._stream.append(self._worker.core.popNextImage())
+            self._store.append(self._worker.core.popNextImage(), key=self._array_key)
         return n
 
     async def _drain_loop(self) -> None:
-        """Drain the MM circular buffer into the zarr stream continuously.
+        """Drain the MM circular buffer into the store continuously.
 
         Polls every 10 ms until cancelled by :meth:`stop`.  The loop starts
         before the sequence acquisition is armed, so it must not exit on its
@@ -361,6 +479,11 @@ class MMZarrDataLogic(DetectorDataLogic):
             await asyncio.sleep(0.01)
 
 
+# ---------------------------------------------------------------------------
+# MMCamera
+# ---------------------------------------------------------------------------
+
+
 class MMCamera(StandardDetector):
     """Micro-Manager camera as an ophyd-async ``StandardDetector``.
 
@@ -368,6 +491,12 @@ class MMCamera(StandardDetector):
     :class:`MMZarrDataLogic` into a single device that participates in both
     step scans (via ``trigger()``) and fly scans (via ``prepare()`` /
     ``kickoff()`` / ``complete()``).
+
+    An :class:`MMZarrStore` is created internally and shared between the arm
+    logic (which opens the stream) and the data logic (which registers its
+    array and drains frames into it).  To share a store across multiple
+    cameras, create an ``MMZarrStore`` explicitly and pass it via
+    ``store``.
 
     Property signals (exposure, binning, etc.) are declared on subclasses
     using ``PropName`` annotations, exactly as with :class:`~ophyd_mmcore.MMDevice`.
@@ -399,8 +528,17 @@ class MMCamera(StandardDetector):
     worker:
         The shared ``MMCoreWorker`` instance.
     store_path:
-        Filesystem path for the output ``.zarr`` store written during
-        acquisition.
+        Filesystem path for the output ``.zarr`` store.  Ignored when
+        ``store`` is provided.
+    store:
+        Optional pre-created :class:`MMZarrStore`.  When given,
+        ``store_path`` is not used.  Useful for sharing one zarr store
+        across multiple cameras.
+    array_key:
+        Key for this camera's array within the store.  Defaults to
+        ``"frames"``.
+    chunk_t:
+        Frames per time-axis chunk (passed to :class:`MMZarrDataLogic`).
     name:
         ophyd-async device name.
     """
@@ -409,12 +547,20 @@ class MMCamera(StandardDetector):
         self,
         mm_label: str,
         worker: MMCoreWorker,
-        store_path: Path,
+        store_path: Path | None = None,
+        *,
+        store: MMZarrStore | None = None,
+        array_key: str = "frames",
+        chunk_t: int = 1,
         name: str = "",
     ) -> None:
+        if store is None:
+            if store_path is None:
+                raise ValueError("Either store_path or store must be provided.")
+            store = MMZarrStore(store_path)
         trigger_logic = MMTriggerLogic(mm_label, worker)
-        arm_logic = MMArmLogic(mm_label, worker, trigger_logic)
-        data_logic = MMZarrDataLogic(store_path, mm_label, worker)
+        arm_logic = MMArmLogic(mm_label, worker, trigger_logic, store)
+        data_logic = MMZarrDataLogic(store, array_key, mm_label, worker, chunk_t)
         super().__init__(
             name=name,
             connector=MMDeviceConnector(mm_label, worker),
