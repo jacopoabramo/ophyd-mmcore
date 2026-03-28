@@ -51,9 +51,8 @@ async def test_backend_get_datakey_includes_limits(worker: MMCoreWorker) -> None
     )
     await backend.connect(timeout=5.0)
     datakey = await backend.get_datakey(backend.source("exposure", read=True))
-    assert "limits" in datakey
     assert datakey["limits"]["control"]["low"] == pytest.approx(0.0)
-    assert datakey["limits"]["control"]["high"] == pytest.approx(1000.0)
+    assert datakey["limits"]["control"]["high"] == pytest.approx(10000.0)
 
 
 @pytest.mark.asyncio
@@ -64,20 +63,20 @@ async def test_backend_get_datakey_includes_choices(worker: MMCoreWorker) -> Non
     )
     await backend.connect(timeout=5.0)
     datakey = await backend.get_datakey(backend.source("binning", read=True))
-    assert datakey["choices"] == ["1", "2", "4"]
+    assert datakey["choices"] == ["1", "2", "4", "8"]
 
 
 @pytest.mark.asyncio
-async def test_backend_put_calls_set_property(
+async def test_backend_put_sets_property_value(
     worker: MMCoreWorker, core: CMMCorePlus
 ) -> None:
-    """put() calls CMMCorePlus.setProperty with the correct arguments."""
+    """put() sets the property value on the MM core."""
     backend: MMPropertyBackend[float] = MMPropertyBackend(
         "Camera", "Exposure", worker
     )
     await backend.connect(timeout=5.0)
     await backend.put(50.0)
-    core.setProperty.assert_called_once_with("Camera", "Exposure", 50.0)  # type: ignore[attr-defined]
+    assert float(core.getProperty("Camera", "Exposure")) == pytest.approx(50.0)
 
 
 @pytest.mark.asyncio

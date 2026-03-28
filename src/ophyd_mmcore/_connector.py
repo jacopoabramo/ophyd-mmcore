@@ -85,13 +85,13 @@ class MMDeviceConnector(DeviceConnector):
         )
 
         for backend, ann in self._filler.create_signals_from_annotations():
-            _fill_backend_with_prop_name(self._mm_label, backend, ann)
+            _fill_backend_with_prop_name(backend, ann)
 
         list(self._filler.create_devices_from_annotations())
 
 
 def _fill_backend_with_prop_name(
-    mm_label: str, backend: MMPropertyBackend[Any], annotations: list[Any]
+    backend: MMPropertyBackend[Any], annotations: list[Any]
 ) -> None:
     """Consume a ``PropName`` annotation and set ``backend._prop``."""
     unhandled = []

@@ -1,8 +1,3 @@
-"""MMCamera: Micro-Manager camera as an ophyd-async StandardDetector.
-
-Compatible with ophyd-async ≥ 0.17a2.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -27,14 +22,9 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from bluesky.protocols import StreamAsset
-    from ophyd_async.core import SignalRW
 
     from ._worker import MMCoreWorker
 
-
-# ---------------------------------------------------------------------------
-# dtype mapping
-# ---------------------------------------------------------------------------
 
 _NP_TO_ZARR: dict[np.dtype, zarr.DataType] = {
     np.dtype("uint8"): zarr.DataType.UINT8,
@@ -57,11 +47,6 @@ def _zarr_dtype(dtype: np.dtype) -> zarr.DataType:
         raise ValueError(
             f"No acquire-zarr DataType for numpy dtype {dtype!r}"
         ) from None
-
-
-# ---------------------------------------------------------------------------
-# MMTriggerLogic
-# ---------------------------------------------------------------------------
 
 
 class MMTriggerLogic(DetectorTriggerLogic):
@@ -94,16 +79,10 @@ class MMTriggerLogic(DetectorTriggerLogic):
         """Store the frame count and optionally set the exposure time."""
         self._n_frames = num
         if livetime != 0.0:
-            label = self._mm_label
             exposure_ms = livetime * 1_000.0
             await self._worker.run(
-                lambda: self._worker.core.setExposure(label, exposure_ms)
+                lambda: self._worker.core.setExposure(self._mm_label, exposure_ms)
             )
-
-
-# ---------------------------------------------------------------------------
-# MMArmLogic
-# ---------------------------------------------------------------------------
 
 
 class MMArmLogic(DetectorArmLogic):
@@ -135,34 +114,30 @@ class MMArmLogic(DetectorArmLogic):
     async def arm(self) -> None:
         """Start MM sequence acquisition."""
         n = self._trigger_logic._n_frames
-        label = self._mm_label
         await self._worker.run(
-            lambda: self._worker.core.startSequenceAcquisition(label, n, 0, False)
+            lambda: self._worker.core.startSequenceAcquisition(
+                self._mm_label, n, 0, False
+            )
         )
 
     async def wait_for_idle(self) -> None:
         """Poll until the sequence acquisition finishes."""
-        label = self._mm_label
         while await self._worker.run(
-            lambda: self._worker.core.isSequenceRunning(label)
+            lambda: self._worker.core.isSequenceRunning(self._mm_label)
         ):
             await asyncio.sleep(0.02)
 
     async def disarm(self) -> None:
         """Stop sequence acquisition if still running."""
-        label = self._mm_label
-        if await self._worker.run(lambda: self._worker.core.isSequenceRunning(label)):
+        if await self._worker.run(
+            lambda: self._worker.core.isSequenceRunning(self._mm_label)
+        ):
             await self._worker.run(
-                lambda: self._worker.core.stopSequenceAcquisition(label)
+                lambda: self._worker.core.stopSequenceAcquisition(self._mm_label)
             )
 
 
-# ---------------------------------------------------------------------------
-# _MMZarrStreamProvider
-# ---------------------------------------------------------------------------
-
-
-class _MMZarrStreamProvider(StreamableDataProvider):
+class MMZarrStreamProvider(StreamableDataProvider):
     """StreamableDataProvider for a zarr store written by acquire-zarr.
 
     Holds a soft signal that the drain loop updates with the running frame
@@ -194,7 +169,7 @@ class _MMZarrStreamProvider(StreamableDataProvider):
         width: int,
         height: int,
     ) -> None:
-        self._frames_written: SignalRW[int] = soft_signal_rw(int)
+        self._frames_written = soft_signal_rw(int)
         self.collections_written_signal = self._frames_written
         self._datakey_name = datakey_name
         self._dtype = dtype
@@ -202,8 +177,7 @@ class _MMZarrStreamProvider(StreamableDataProvider):
         self._height = height
         self._last_emitted = 0
 
-        bundle_composer = ComposeStreamResource()
-        self._bundle = bundle_composer(
+        self._bundle = ComposeStreamResource()(
             mimetype="application/x-zarr",
             uri=store_uri,
             data_key=datakey_name,
@@ -276,16 +250,10 @@ class MMZarrDataLogic(DetectorDataLogic):
         self._worker = worker
 
         self._stream: zarr.ZarrStream | None = None
-        self._provider: _MMZarrStreamProvider | None = None
+        self._provider: MMZarrStreamProvider | None = None
         self._drain_task: asyncio.Task[None] | None = None
 
-    # ------------------------------------------------------------------
-    # DetectorDataLogic interface
-    # ------------------------------------------------------------------
-
-    async def prepare_unbounded(
-        self, datakey_name: str
-    ) -> _MMZarrStreamProvider:
+    async def prepare_unbounded(self, datakey_name: str) -> MMZarrStreamProvider:
         """Open the zarr store and return the stream provider."""
         await self.stop()
 
@@ -327,7 +295,7 @@ class MMZarrDataLogic(DetectorDataLogic):
             )
         )
 
-        self._provider = _MMZarrStreamProvider(
+        self._provider = MMZarrStreamProvider(
             store_uri=f"file://{self._store_path.resolve()}",
             array_key=self._ARRAY_KEY,
             datakey_name=datakey_name,
@@ -352,10 +320,6 @@ class MMZarrDataLogic(DetectorDataLogic):
             self._stream.close()
             self._stream = None
 
-    # ------------------------------------------------------------------
-    # Worker-thread helpers (must not touch asyncio state)
-    # ------------------------------------------------------------------
-
     def _get_frame_shape(self) -> tuple[int, int, np.dtype]:
         """Read frame dimensions from MM; runs on the worker thread."""
         core = self._worker.core
@@ -370,7 +334,9 @@ class MMZarrDataLogic(DetectorDataLogic):
 
         Returns ``(n_popped, still_running)``.  Runs on the worker thread.
         """
-        assert self._stream is not None, "_drain_batch called before prepare_unbounded()"
+        assert self._stream is not None, (
+            "_drain_batch called before prepare_unbounded()"
+        )
         n = self._worker.core.getRemainingImageCount()
         for _ in range(n):
             self._stream.append(self._worker.core.popNextImage())
@@ -382,15 +348,13 @@ class MMZarrDataLogic(DetectorDataLogic):
 
         Runs on the worker thread.
         """
-        assert self._stream is not None, "_final_drain called before prepare_unbounded()"
+        assert self._stream is not None, (
+            "_final_drain called before prepare_unbounded()"
+        )
         n = self._worker.core.getRemainingImageCount()
         for _ in range(n):
             self._stream.append(self._worker.core.popNextImage())
         return n
-
-    # ------------------------------------------------------------------
-    # Background drain task
-    # ------------------------------------------------------------------
 
     async def _drain_loop(self) -> None:
         """Drain the MM circular buffer into the zarr stream continuously.
@@ -398,7 +362,9 @@ class MMZarrDataLogic(DetectorDataLogic):
         Polls every 10 ms.  Exits once the sequence stops and the buffer is
         empty, then performs one final drain to catch any last frames.
         """
-        assert self._provider is not None, "_drain_loop called before prepare_unbounded()"
+        assert self._provider is not None, (
+            "_drain_loop called before prepare_unbounded()"
+        )
         frames_written = 0
 
         while True:
@@ -416,11 +382,6 @@ class MMZarrDataLogic(DetectorDataLogic):
         if n_final > 0:
             frames_written += n_final
             await self._provider._frames_written.set(frames_written)
-
-
-# ---------------------------------------------------------------------------
-# MMCamera
-# ---------------------------------------------------------------------------
 
 
 class MMCamera(StandardDetector):

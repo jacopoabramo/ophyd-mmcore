@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from importlib.metadata import version
 
-from ._camera import MMArmLogic, MMCamera, MMTriggerLogic, MMZarrDataLogic
+from ._camera import (
+    MMArmLogic,
+    MMCamera,
+    MMTriggerLogic,
+    MMZarrDataLogic,
+    MMZarrStreamProvider,
+)
 from ._connector import PropName
 from ._device import MMDevice
 from ._devices import MMAutoFocus, MMGalvo, MMPump, MMShutter, MMStateDevice
@@ -30,6 +36,7 @@ __all__ = [
     "MMTriggerLogic",
     "MMArmLogic",
     "MMZarrDataLogic",
+    "MMZarrStreamProvider",
     "MMShutter",
     "MMStateDevice",
     "MMAutoFocus",

@@ -41,17 +41,17 @@ class MMPropertyBackend(SignalBackend[PrimitiveT]):
 
     def __init__(
         self,
-        device_label: str,
+        label: str,
         property_name: str,
         worker: MMCoreWorker,
         datatype: type[PrimitiveT] | None = None,
     ) -> None:
-        self._dev = device_label
+        self._dev = label
         self._prop = property_name
         self._worker = worker
 
         if datatype is None:
-            pt = worker.core.getPropertyType(device_label, property_name)
+            pt = worker.core.getPropertyType(label, property_name)
             # to_python() returns str | float | int | None; fall back to str
             inferred: type[Primitive] = pt.to_python() or str
             datatype = cast("type[PrimitiveT]", inferred)
@@ -63,10 +63,6 @@ class MMPropertyBackend(SignalBackend[PrimitiveT]):
         self._loop: asyncio.AbstractEventLoop | None = None
 
         super().__init__(datatype)
-
-    # ------------------------------------------------------------------
-    # SignalBackend interface
-    # ------------------------------------------------------------------
 
     def source(self, name: str, read: bool) -> str:
         """Return the source URI for this signal."""

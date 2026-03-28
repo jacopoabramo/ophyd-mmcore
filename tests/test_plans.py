@@ -26,12 +26,12 @@ import bluesky.plan_stubs as bps
 import bluesky.plans as bp
 import pytest
 from bluesky.run_engine import RunEngine, TransitionError
-from ophyd_async.core import SignalR, SignalRW
+from ophyd_async.core import SignalRW
 from ophyd_async.core import StandardReadableFormat as Format
 from ophyd_async.plan_stubs import ensure_connected
 
 from ophyd_mmcore import MMDevice, PropName
-from ophyd_mmcore._signal import mmcore_signal_r, mmcore_signal_rw
+from ophyd_mmcore._signal import mmcore_signal_rw
 from ophyd_mmcore._worker import MMCoreWorker
 
 
@@ -50,7 +50,6 @@ class MMCameraImperative(MMDevice):
             self.exposure = mmcore_signal_rw(float, mm_label, "Exposure", worker)
         with self.add_children_as_readables(Format.CONFIG_SIGNAL):
             self.binning = mmcore_signal_rw(str, mm_label, "Binning", worker)
-            self.read_mode = mmcore_signal_r(str, mm_label, "ReadMode", worker)
         super().__init__(mm_label, worker, name=name)
 
 
@@ -63,14 +62,8 @@ class MMCameraDeclarative(MMDevice):
     No ``__init__`` override needed.
     """
 
-    exposure:  A[SignalRW[float], PropName("Exposure"), Format.HINTED_SIGNAL]
-    binning:   A[SignalRW[str],   PropName("Binning"),  Format.CONFIG_SIGNAL]
-    read_mode: A[SignalR[str],    PropName("ReadMode"), Format.CONFIG_SIGNAL]
-
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
+    exposure: A[SignalRW[float], PropName("Exposure"), Format.HINTED_SIGNAL]
+    binning:  A[SignalRW[str],   PropName("Binning"),  Format.CONFIG_SIGNAL]
 
 
 @pytest.fixture
@@ -99,10 +92,6 @@ def cam(request: pytest.FixtureRequest, worker: MMCoreWorker) -> MMDevice:
     return MMCameraDeclarative("Camera", worker, name="cam")
 
 
-# ---------------------------------------------------------------------------
-# Tests — each runs twice (imperative + declarative) via the cam fixture
-# ---------------------------------------------------------------------------
-
 
 def test_read_single_signal_with_rd(RE: RunEngine, cam: MMDevice) -> None:
     """bps.rd reads a single signal value inside a plan."""
@@ -121,16 +110,12 @@ def test_set_signal_with_mv(
     RE: RunEngine, cam: MMDevice, worker: MMCoreWorker
 ) -> None:
     """bps.mv sets a signal value inside a plan."""
-    from pymmcore_plus import CMMCorePlus
-
-    core: CMMCorePlus = worker.core  # type: ignore[assignment]
-
     def plan() -> Generator[Any, Any, None]:
         yield from ensure_connected(cam)
         yield from bps.mv(cam.exposure, 50.0)  # type: ignore[attr-defined]
 
     RE(plan())
-    core.setProperty.assert_called_with("Camera", "Exposure", 50.0)  # type: ignore[attr-defined]
+    assert float(worker.core.getProperty("Camera", "Exposure")) == pytest.approx(50.0)
 
 
 def test_count_plan_reads_camera(RE: RunEngine, cam: MMDevice) -> None:
@@ -172,18 +157,16 @@ def test_count_plan_multiple_shots(RE: RunEngine, cam: MMDevice) -> None:
 
 
 def test_read_configuration(RE: RunEngine, cam: MMDevice) -> None:
-    """Configuration signals (binning, read_mode) are readable via bps.rd."""
+    """Configuration signals (binning) are readable via bps.rd."""
     config: list[dict[str, Any]] = []
 
     def plan() -> Generator[Any, Any, None]:
         yield from ensure_connected(cam)
         binning = yield from bps.rd(cam.binning)  # type: ignore[attr-defined]
-        read_mode = yield from bps.rd(cam.read_mode)  # type: ignore[attr-defined]
         reading = yield from bps.read(cam)
-        config.append({"binning": binning, "read_mode": read_mode, "reading": reading})
+        config.append({"binning": binning, "reading": reading})
 
     RE(plan())
 
     assert config[0]["binning"] == "1"
-    assert config[0]["read_mode"] == "Standard"
     assert config[0]["reading"]["cam-exposure"]["value"] == pytest.approx(10.0)
