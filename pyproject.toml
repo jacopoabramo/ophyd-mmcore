@@ -38,7 +38,7 @@ dev = [
 
 [tool.pyright]
 include = ["src/ophyd_mmcore"]
-exclude = ["tests/**", "**/node_modules", "**/__pycache__", "**/.*", ".venv"]
+ignore = ["tests"]
 pythonVersion = "3.11"
 typeCheckingMode = "standard"
 venvPath = "."
