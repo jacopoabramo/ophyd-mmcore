@@ -13,6 +13,8 @@ from typing import Annotated as A
 from typing import Any
 from unittest.mock import patch
 
+from pymmcore_plus.core._constants import PropertyType
+
 import pytest
 from bluesky.protocols import Location
 from bluesky.run_engine import RunEngine, TransitionError
@@ -60,7 +62,6 @@ def core_z() -> Generator[CMMCorePlus, None, None]:
         _position["z"] = value
 
     def _get_property_type(device: str, prop: str) -> Any:
-        from pymmcore_plus.core._constants import PropertyType
         return PropertyType.Float
 
     def _get_property(device: str, prop: str) -> str:
