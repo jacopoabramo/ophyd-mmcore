@@ -2,6 +2,8 @@
 
 from importlib.metadata import version
 
+from ._controller import MMController
+
 __version__ = version("ophyd-mmcore")
 
-__all__ = ["__version__"]
+__all__ = ["MMController", "__version__"]

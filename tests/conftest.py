@@ -16,6 +16,8 @@ from pymmcore_plus.experimental.unicore import (
     pymm_property,
 )
 
+from ophyd_mmcore import MMController
+
 
 class FakeCamera(SimpleCameraDevice):
     """Camera with a 16 x 24 uint16 sensor whose frames hold their number."""
@@ -171,3 +173,19 @@ def uni_core() -> Iterator[UniMMCore]:
         core.defineConfig("Channel", preset, "Wheel", "Label", preset)
     yield core
     core.unloadAllDevices()
+
+
+@pytest.fixture
+def ctrl(uni_core: UniMMCore) -> Iterator[MMController]:
+    """Return a controller on the `uni_core` fixture, closed after the test."""
+    controller = MMController(uni_core)
+    yield controller
+    controller.close()
+
+
+@pytest.fixture
+def bare_ctrl() -> Iterator[MMController]:
+    """Return a controller on a core with no devices."""
+    controller = MMController(UniMMCore())
+    yield controller
+    controller.close()
