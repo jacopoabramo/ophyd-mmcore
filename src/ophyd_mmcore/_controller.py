@@ -4,6 +4,7 @@ import threading
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal, ParamSpec, TypeVar
 
 import numpy as np
@@ -75,6 +76,19 @@ class MMController:
         ]
         for signal, slot in self._connections:
             signal.connect(slot)
+
+    @classmethod
+    def from_config(
+        cls, path: str | Path, core: CMMCorePlus | None = None
+    ) -> "MMController":
+        """Load a Micro-Manager configuration file into a core and wrap it.
+
+        A new core is created when `core` is not given. The load blocks until
+        the devices are initialised.
+        """
+        core = CMMCorePlus() if core is None else core
+        core.loadSystemConfiguration(path)
+        return cls(core)
 
     @property
     def core(self) -> CMMCorePlus:
