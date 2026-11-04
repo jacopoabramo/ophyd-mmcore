@@ -1,10 +1,17 @@
 from collections.abc import Sequence
+from dataclasses import dataclass
 
+from bluesky.protocols import Location
 from ophyd_async.core import (
     DeviceMap,
+    MovableLogic,
     PathProvider,
+    SignalDatatypeT,
     SignalRW,
+    StandardMovable,
     StandardReadable,
+    TimeoutCalculator,
+    TriggerableCommand,
 )
 from ophyd_async.core import StandardReadableFormat as Format
 
@@ -78,3 +85,40 @@ class MMSystem(StandardReadable):
                 ctrl, path_provider=path_provider, move_timeout=move_timeout
             ),
         )
+
+
+@dataclass
+class MMMoveLogic(MovableLogic[SignalDatatypeT]):
+    """How a device moves: a put on `setpoint` returns once the device is idle.
+
+    `halt` stops the move, and `move_timeout` is the time a move may take, or
+    `None` for no limit.
+    """
+
+    halt: TriggerableCommand | None
+    move_timeout: float | None
+
+    async def move(
+        self, new_position: SignalDatatypeT, timeout: TimeoutCalculator
+    ) -> None:
+        """Put `new_position` on the setpoint signal."""
+        await self.setpoint.set(new_position, timeout=timeout())
+
+    async def stop(self) -> None:
+        """Run `halt`, if there is one."""
+        if self.halt is not None:
+            await self.halt.trigger()
+
+    async def calculate_timeout(
+        self, old_position: SignalDatatypeT, new_position: SignalDatatypeT
+    ) -> float | None:
+        """Return `move_timeout`."""
+        return self.move_timeout
+
+
+class MMMovable(StandardMovable[SignalDatatypeT]):
+    """A device that moves through [`MMMoveLogic`][ophyd_mmcore.MMMoveLogic]."""
+
+    async def locate(self) -> Location[SignalDatatypeT]:
+        """Return the stored target as the setpoint and the hardware value as the readback."""
+        return await self.movable_logic.setpoint.locate()

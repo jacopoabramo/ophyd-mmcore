@@ -1,8 +1,9 @@
 import re
+import types
 import typing
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Annotated, Any, Literal, get_args, get_origin
+from typing import Annotated, Any, Literal, Union, get_args, get_origin
 
 from ophyd_async.core import (
     Command,
@@ -38,9 +39,26 @@ class Label:
     properties: tuple[str, ...] = ()
 
 
-SIGNAL_MARKERS = (Property,)
-COMMAND_MARKERS = ()
-DEVICE_MARKERS = (Label,)
+@dataclass(frozen=True)
+class Position:
+    """Mark the position signal of a moving device, in micrometres for a stage."""
+
+
+@dataclass(frozen=True)
+class Halt:
+    """Mark the command that stops the device's label."""
+
+
+@dataclass(frozen=True)
+class XYAxis:
+    """Mark a child device that is one axis of the parent's XY stage."""
+
+    axis: Literal["x", "y"]
+
+
+SIGNAL_MARKERS = (Property, Position)
+COMMAND_MARKERS = (Halt,)
+DEVICE_MARKERS = (Label, XYAxis)
 MARKERS = SIGNAL_MARKERS + COMMAND_MARKERS + DEVICE_MARKERS
 
 
@@ -105,7 +123,7 @@ class MMConnector(DeviceConnector):
             self.label = label
         if physical is not None:
             self.physical = tuple(physical)
-        self.axis = axis
+        self.axis: Literal["x", "y"] | None = axis
         self.output = output
         self.properties = tuple(properties)
 
@@ -132,6 +150,10 @@ class MMConnector(DeviceConnector):
             extras: list[Any] = []
             if get_origin(hint) is Annotated:
                 hint, *extras = get_args(hint)
+            if get_origin(hint) in (Union, types.UnionType):
+                args = [arg for arg in get_args(hint) if arg is not types.NoneType]
+                if len(args) == 1:
+                    hint = args[0]
             origin = get_origin(hint) or hint
             if not (isinstance(origin, type) and issubclass(origin, Device)):
                 continue
@@ -150,8 +172,10 @@ class MMConnector(DeviceConnector):
                 raise TypeError(
                     f"{where}: {type(marker).__name__} does not fit a {origin.__name__}"
                 )
-            if isinstance(marker, Property) and not self.label:
-                raise TypeError(f"{where}: Property needs a device with a label")
+            if isinstance(marker, Property | Position | Halt) and not self.label:
+                raise TypeError(
+                    f"{where}: {type(marker).__name__} needs a device with a label"
+                )
 
     def create_children_from_annotations(self, device: Device) -> None:
         """Create every annotated signal, command and device of `device`."""
@@ -165,16 +189,33 @@ class MMConnector(DeviceConnector):
             command_backend_factory=lambda sig: MMCommandBackend(),
         )
         for backend, extras in self.filler.create_signals_from_annotations():
-            match take_marker(extras):
+            marker = take_marker(extras)
+            match marker:
                 case Property(name):
                     backend.bind(self.ctrl.property_source(self.label, name))
-        for _, extras in self.filler.create_commands_from_annotations():
-            match take_marker(extras):
-                case marker:
+                case Position():
+                    backend.bind(
+                        self.ctrl.position_source(self.label, self.axis or "z")  # pyright: ignore[reportArgumentType]
+                    )
+                case _:
+                    raise TypeError(f"{marker!r} does not fit a Signal")
+        for backend, extras in self.filler.create_commands_from_annotations():
+            marker = take_marker(extras)
+            match marker:
+                case Halt():
+                    backend.bind(
+                        self.ctrl.halt(self.label), f"mmcore://{self.label}/halt"
+                    )
+                case _:
                     raise TypeError(f"{marker!r} does not fit a Command")
         for connector, extras in self.filler.create_devices_from_annotations():
-            match take_marker(extras):
+            marker = take_marker(extras)
+            match marker:
                 case Label(label, physical, properties):
                     connector.set_address(
                         label=label, physical=physical, properties=properties
                     )
+                case XYAxis(axis):
+                    connector.set_address(axis=axis)
+                case _:
+                    raise TypeError(f"{marker!r} does not fit a Device")

@@ -81,6 +81,10 @@ class UnmarkedCommand(MMDevice):
     halt: Command[[], None]
 
 
+class OptionalUnmarked(MMSystem):
+    wheel: Wheel | None
+
+
 class PropertyOnSystem(MMSystem):
     power: A[SignalR[float], Property("Power")]
 
@@ -93,6 +97,7 @@ class PropertyOnSystem(MMSystem):
         (LabelOnSignal, lambda c, ctrl: c("Laser", ctrl), "LabelOnSignal.power"),
         (PropertyOnDevice, lambda c, ctrl: c(ctrl), "PropertyOnDevice.wheel"),
         (UnmarkedCommand, lambda c, ctrl: c("Laser", ctrl), "UnmarkedCommand.halt"),
+        (OptionalUnmarked, lambda c, ctrl: c(ctrl), "OptionalUnmarked.wheel"),
         (PropertyOnSystem, lambda c, ctrl: c(ctrl), "PropertyOnSystem.power"),
     ],
 )

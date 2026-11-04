@@ -1,9 +1,9 @@
 import asyncio
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, ParamSpec, TypeVar
+from typing import Any, Literal, ParamSpec, TypeVar
 
 from event_model import Limits
 from ophyd_async.core import SignalMetadata
@@ -50,6 +50,8 @@ class MMController:
         self._lock = threading.Lock()
         self._subscriptions: dict[EventKey, list[Subscription]] = {}
         self._closed = False
+        self._targets: dict[tuple[str, str], float] = {}
+        self._xy_locks: dict[str, asyncio.Lock] = {}
         events = core.events
         self._connections: list[tuple[Any, Callable[..., None]]] = [
             (events.propertyChanged, self._on_property),
@@ -146,6 +148,87 @@ class MMController:
             infer=infer,
             metadata=describe,
         )
+
+    def position_source(
+        self, label: str, axis: Literal["z", "x", "y"]
+    ) -> MMSource[float]:
+        """Return the source of a stage position, in micrometres.
+
+        `axis` is `"z"` for a one-axis stage, and `"x"` or `"y"` for an axis of
+        an XY stage. Writing starts the move and returns when the stage is
+        idle, and `setpoint` reports the last target written, which starts at
+        the position at connect. A write the core rejects leaves the target
+        as it was. The two axes of an XY stage move with one core call, so
+        writes to them share a lock and each carries the other axis's target.
+        """
+        getters = {
+            "z": self._core.getPosition,
+            "x": self._core.getXPosition,
+            "y": self._core.getYPosition,
+        }
+        other = "y" if axis == "x" else "x"
+
+        async def read() -> float:
+            position = await self.call(getters[axis], label)
+            return self._targets.setdefault((label, axis), position)
+
+        async def setpoint() -> float:
+            if (label, axis) not in self._targets:
+                await read()
+            return self._targets[label, axis]
+
+        async def store_and_move(value: float, move: Callable[[], None]) -> None:
+            previous = self._targets.get((label, axis))
+            self._targets[label, axis] = value
+            try:
+                await self.call(move)
+            except Exception:
+                if previous is None:
+                    del self._targets[label, axis]
+                else:
+                    self._targets[label, axis] = previous
+                raise
+
+        async def write(value: float) -> None:
+            if axis == "z":
+                await store_and_move(
+                    value, lambda: self._core.setPosition(label, value)
+                )
+            else:
+                async with self._xy_locks.setdefault(label, asyncio.Lock()):
+                    if (label, other) not in self._targets:
+                        self._targets[label, other] = await self.call(
+                            getters[other], label
+                        )
+                    target = self._targets[label, other]
+                    x, y = (value, target) if axis == "x" else (target, value)
+                    await store_and_move(
+                        value, lambda: self._core.setXYPosition(label, x, y)
+                    )
+            await self.call(self._core.waitForDevice, label)
+
+        async def metadata() -> SignalMetadata:
+            return SignalMetadata(units="um")
+
+        name = "position" if axis == "z" else axis
+        return MMSource(
+            uri=f"mmcore://{label}/{name}",
+            read=read,
+            write=write,
+            setpoint=setpoint,
+            subscribe=lambda callback: self.subscribe(
+                (label, f"core:{name}"), callback
+            ),
+            metadata=metadata,
+        )
+
+    def halt(self, label: str) -> Callable[[], Awaitable[None]]:
+        """Return the call that stops the device `label`."""
+
+        async def run() -> None:
+            await self.call(self._core.stop, label)
+
+        return run
 
     def close(self) -> None:
         """Disconnect every core event and drop every subscription."""

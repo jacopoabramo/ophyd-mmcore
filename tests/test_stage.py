@@ -1,0 +1,63 @@
+import asyncio
+
+import pytest
+from ophyd_async.core import init_devices
+
+from ophyd_mmcore import MMXYStage, MMZStage
+
+
+async def test_z_move_waits_for_idle(ctrl):
+    """Complete a Z move only once the stage reports idle."""
+    async with init_devices():
+        z = MMZStage("Z", ctrl)
+    await z.set(12.5)
+    assert (await z.locate()) == {"setpoint": 12.5, "readback": 12.5}
+    assert (await z.read()).keys() == {"z"}
+
+
+async def test_concurrent_xy_axis_moves_both_land(ctrl):
+    """Move both XY axes at once and land at both targets."""
+    async with init_devices():
+        xy = MMXYStage("XY", ctrl)
+    await asyncio.gather(xy.x.set(1.0), xy.y.set(2.0))
+    assert await xy.x.position.get_value() == 1.0
+    assert await xy.y.position.get_value() == 2.0
+
+
+async def test_rejected_move_keeps_previous_setpoint(ctrl):
+    """Raise the adapter's error and keep the previous setpoint."""
+    async with init_devices():
+        z = MMZStage("Z", ctrl)
+    await z.set(5.0)
+    with pytest.raises(ValueError):
+        await z.set(5000.0)
+    assert (await z.locate())["setpoint"] == 5.0
+
+
+async def test_stop_fails_the_move(ctrl):
+    """Fail an ongoing move when stop is called."""
+    async with init_devices():
+        z = MMZStage("Z", ctrl)
+    status = z.set(100.0)
+    started = asyncio.Event()
+    status.watch(lambda *_, **__: started.set())
+    await asyncio.wait_for(started.wait(), 5)
+    await z.stop()
+    with pytest.raises(RuntimeError, match="stopped"):
+        await status
+
+
+async def test_mock_stage_moves_instantly(bare_ctrl):
+    """Move a mock stage without a core."""
+    async with init_devices(mock=True):
+        z = MMZStage("Z", bare_ctrl)
+    await z.set(3.0)
+    assert await z.position.get_value() == 3.0
+
+
+async def test_move_longer_than_move_timeout_fails(ctrl):
+    """Fail a move that takes longer than move_timeout."""
+    async with init_devices():
+        z = MMZStage("Z", ctrl, move_timeout=0.001)
+    with pytest.raises(TimeoutError):
+        await z.set(1.0)
