@@ -375,7 +375,8 @@ class MMController:
             If an earlier call for `label` named other physical cameras.
         """
         outputs = tuple(physical) or (label,)
-        camera = self._cameras.setdefault(label, CameraIO(self, label, outputs))
+        if (camera := self._cameras.get(label)) is None:
+            camera = self._cameras[label] = CameraIO(self, label, outputs)
         if camera.physical != outputs:
             raise ValueError(
                 f"Camera {label!r} has the outputs {camera.physical}, not {outputs}"
@@ -397,26 +398,29 @@ class MMController:
             )
         self._acquiring = label
         try:
-            self._restore = await self.call(self._begin_sequence, label, prepare)
+            await self.call(self._begin_sequence, label, prepare)
         except Exception:
             self._acquiring = None
             raise
         self._router.start()
 
-    def _begin_sequence(
-        self, label: str, prepare: Callable[[], None]
-    ) -> tuple[str, bool]:
-        restore = (self._core.getCameraDevice(), self._core.getAutoShutter())
+    def _begin_sequence(self, label: str, prepare: Callable[[], None]) -> None:
+        # Recorded before the core changes, so that `close` restores it even
+        # when the caller stopped waiting for this call.
+        restore = self._restore = (
+            self._core.getCameraDevice(),
+            self._core.getAutoShutter(),
+        )
         self._core.setCameraDevice(label)
         self._core.setAutoShutter(False)
         try:
             prepare()
             self._core.startSequenceAcquisition(label, SEQUENCE_LENGTH, 0, False)
         except Exception:
+            self._restore = None
             self._core.setCameraDevice(restore[0])
             self._core.setAutoShutter(restore[1])
             raise
-        return restore
 
     async def _stop_sequence(self, label: str) -> None:
         """Stop the sequence of `label` and restore the camera and AutoShutter."""

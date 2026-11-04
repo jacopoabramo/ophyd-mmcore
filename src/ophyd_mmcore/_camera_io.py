@@ -1,10 +1,11 @@
 import asyncio
 import logging
 import threading
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final, Literal
+from typing import TYPE_CHECKING, Any, Final, Literal, TypeVar
 
 import acquire_zarr as az
 import numpy as np
@@ -17,6 +18,8 @@ if TYPE_CHECKING:
 
 SEQUENCE_LENGTH: Final = 2**31 - 1
 """The number of frames a sequence asks for, the largest Micro-Manager accepts."""
+
+T = TypeVar("T")
 
 logger = logging.getLogger(__name__)
 
@@ -176,8 +179,8 @@ class CameraIO:
             return self._values[name]
 
         writers = {
-            "acquire": self._write_acquire,
-            "capture": self._write_capture,
+            "acquire": partial(self._serialised, self._change_acquire),
+            "capture": partial(self._serialised, self._change_capture),
             "num_capture": self._write_num_capture,
         }
         return MMSource(
@@ -212,7 +215,7 @@ class CameraIO:
             return getattr(output, name)
 
         async def write_file_path(value: str) -> None:
-            await self._write_file_path(physical, value)
+            await self._serialised(self._change_file_path, physical, value)
 
         async def write_data_key(value: str) -> None:
             with self._lock:
@@ -247,15 +250,7 @@ class CameraIO:
         RuntimeError
             If the camera is capturing.
         """
-        async with self._write_lock:
-            if self._values["capture"]:
-                raise RuntimeError(
-                    f"Cannot change {key} of camera {self.label!r} while it captures"
-                )
-            pause = self._running
-            value = await self._ctrl.call(self._write_paused, set_, get, pause)
-            self._settings[key] = value
-            return value
+        return await self._serialised(self._change_setting, key, set_, get)
 
     def deliver(self, physical: str, frame: np.ndarray) -> bool:
         """Append a frame to its output's store while the gate is open.
@@ -353,59 +348,98 @@ class CameraIO:
             metadata=metadata,
         )
 
-    async def _write_acquire(self, value: bool) -> None:
+    async def _serialised(self, change: Callable[..., Awaitable[T]], *args: Any) -> T:
+        """Run a change that touches the sequence or the stores, one at a time.
+
+        A cancelled caller waits for the change to finish before the
+        cancellation is raised, because the core calls it makes run on in
+        their threads and the flags must end up matching them.
+        """
         async with self._write_lock:
-            if self._values["acquire"]:
-                if value and not self._faulted:
-                    return
-                with self._lock:
-                    self._update(capture=False)
+            task = asyncio.ensure_future(change(*args))
+            cancelled = False
+            while not task.done():
+                try:
+                    await asyncio.wait({task})
+                except asyncio.CancelledError:
+                    cancelled = True
+            if cancelled:
+                if not task.cancelled():
+                    task.exception()
+                raise asyncio.CancelledError
+            return task.result()
+
+    async def _change_setting(
+        self, key: str, set_: Callable[[], None], get: Callable[[], Any]
+    ) -> Any:
+        if self._values["capture"]:
+            raise RuntimeError(
+                f"Cannot change {key} of camera {self.label!r} while it captures"
+            )
+        value = await self._ctrl.call(self._write_paused, set_, get, self._running)
+        self._settings[key] = value
+        return value
+
+    async def _change_acquire(self, value: bool) -> None:
+        if self._values["acquire"]:
+            if value and not self._faulted:
+                return
+            with self._lock:
+                self._update(capture=False)
+            try:
                 await self._ctrl._stop_sequence(self.label)
+            finally:
                 with self._lock:
                     self._update(acquire=False)
-            if value:
-                await self._ctrl._start_sequence(self.label, self._refresh_layouts)
-                with self._lock:
-                    self._faulted = False
-                    self._update(acquire=True, last_error="")
+        if value:
+            await self._ctrl._start_sequence(self.label, self._refresh_layouts)
+            with self._lock:
+                self._faulted = False
+                self._update(acquire=True, last_error="")
 
-    async def _write_capture(self, value: bool) -> None:
-        async with self._write_lock:
-            if not value:
-                with self._lock:
-                    self._update(capture=False)
-                return
-            if self._faulted:
-                raise RuntimeError(
-                    f"Camera {self.label!r} faulted: {self._values['last_error']}"
-                )
-            if not self._values["acquire"]:
-                raise RuntimeError(f"Camera {self.label!r} is not acquiring")
-            if missing := [p for p, o in self._outputs.items() if not o.file_path]:
-                raise RuntimeError(
-                    f"Camera {self.label!r} has no file_path for {', '.join(missing)}"
-                )
-            await self._ctrl.call(self._open_gate)
+    async def _change_capture(self, value: bool) -> None:
+        if not value:
+            with self._lock:
+                self._update(capture=False)
+            return
+        if self._faulted:
+            raise RuntimeError(
+                f"Camera {self.label!r} faulted: {self._values['last_error']}"
+            )
+        if not self._values["acquire"]:
+            raise RuntimeError(f"Camera {self.label!r} is not acquiring")
+        if missing := [p for p, o in self._outputs.items() if not o.file_path]:
+            raise RuntimeError(
+                f"Camera {self.label!r} has no file_path for {', '.join(missing)}"
+            )
+        await self._ctrl.call(self._open_gate)
 
     async def _write_num_capture(self, value: int) -> None:
         with self._lock:
             self._update(num_capture=value)
+            written = [o.written for o in self._outputs.values()]
+            if self._values["capture"] and value and min(written) >= value:
+                self._update(capture=False)
 
-    async def _write_file_path(self, physical: str, path: str) -> None:
-        async with self._write_lock:
+    async def _change_file_path(self, physical: str, path: str) -> None:
+        if self._values["capture"]:
+            raise RuntimeError(
+                f"Cannot change the store of camera {self.label!r} while it captures"
+            )
+        if path:
+            self._check_layouts(physical, await self._read_layouts())
+            if Path(path).exists():
+                raise FileExistsError(f"Store {path} already exists")
+        output = self._outputs[physical]
+        await self._ctrl.call(self._close_store, output)
+        with self._lock:
+            output.file_path = path
             if path:
-                self._check_layouts(physical, await self._read_layouts())
-                if Path(path).exists():
-                    raise FileExistsError(f"Store {path} already exists")
-            output = self._outputs[physical]
-            await self._ctrl.call(self._close_store, output)
-            with self._lock:
-                output.file_path = path
                 output.captured = 0
-            for name in ("file_path", "captured"):
-                self._ctrl._dispatch(
-                    (self.label, f"output:{physical}:{name}"), getattr(output, name)
-                )
+        for name in ("file_path", "captured"):
+            self._ctrl._dispatch(
+                (self.label, f"output:{physical}:{name}"), getattr(output, name)
+            )
 
     def _check_layouts(self, physical: str, layouts: dict[str, Layout]) -> None:
         layout = layouts[physical]
@@ -498,6 +532,9 @@ class CameraIO:
                         layout.dtype,
                     )
                 output.written = 0
+            # shortcut: a frame already being exposed when the gate opens can be
+            # written, upgrade to a check against the frame's timestamp if motion
+            # blur appears.
             self._update(capture=True)
 
     def _close_store(self, output: Output) -> None:

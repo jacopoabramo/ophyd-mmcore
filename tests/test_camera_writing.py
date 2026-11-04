@@ -1,3 +1,6 @@
+import asyncio
+import threading
+import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, fields
 from pathlib import Path
@@ -81,6 +84,20 @@ async def start_capture(s: CameraSignals, path: Path, num_capture: int) -> None:
     await s.capture.set(True)
 
 
+async def acquire_signal(ctrl: MMController, label: str) -> SignalRW[bool]:
+    signal = SignalRW(
+        MMSignalBackend(bool, ctrl.camera_io(label).source("acquire")), name=label
+    )
+    await signal.connect()
+    return signal
+
+
+async def wait_until(condition) -> None:
+    async with asyncio.timeout(5):
+        while not condition():
+            await asyncio.sleep(0.01)
+
+
 def raising_append(self, frame: np.ndarray) -> None:
     raise OSError("disk full")
 
@@ -157,10 +174,7 @@ async def test_acquire_sets_and_restores_core_state(cam_signals, uni_core):
 
 async def test_second_sequence_on_core_is_refused(cam_signals, ctrl):
     """Refuse a second acquiring camera on the same core, and allow it once the first stops."""
-    cam2 = SignalRW(
-        MMSignalBackend(bool, ctrl.camera_io("Cam2").source("acquire")), name="acquire2"
-    )
-    await cam2.connect()
+    cam2 = await acquire_signal(ctrl, "Cam2")
     await cam_signals.acquire.set(True)
     with pytest.raises(RuntimeError, match="'Cam'"):
         await cam2.set(True)
@@ -182,7 +196,79 @@ async def test_close_while_capturing_cleans_up(cam_signals, ctrl, uni_core, tmp_
     ctrl.close()
     ctrl.close()
     assert not uni_core.isSequenceRunning("Cam") and uni_core.getAutoShutter() is True
-    zarr.open(str(tmp_path / "a.zarr"))
+    captured = await cam_signals.out.captured.get_value()
+    assert zarr.open(str(tmp_path / "a.zarr"))["cam"].shape[0] == captured  # type: ignore[index]
+
+
+async def test_stop_while_capturing_closes_the_store(
+    cam_signals, ctrl, uni_core, tmp_path
+):
+    """Keep every captured frame when acquiring stops mid-capture, and free the core."""
+    await start_capture(cam_signals, tmp_path / "a.zarr", 0)
+    await wait_for_value(cam_signals.out.captured, lambda n: n > 0, timeout=5)
+    await cam_signals.acquire.set(False)
+    await cam_signals.out.file_path.set("")
+    captured = await cam_signals.out.captured.get_value()
+    assert zarr.open(str(tmp_path / "a.zarr"))["cam"].shape[0] == captured  # type: ignore[index]
+    assert uni_core.getAutoShutter() is True
+    cam2 = await acquire_signal(ctrl, "Cam2")
+    await cam2.set(True)
+
+
+async def test_store_change_while_capturing_is_refused(cam_signals, tmp_path):
+    """Refuse to close or replace the store during a capture."""
+    await start_capture(cam_signals, tmp_path / "a.zarr", 0)
+    with pytest.raises(RuntimeError, match="Cam"):
+        await cam_signals.out.file_path.set("")
+
+
+async def test_lower_num_capture_closes_the_gate(cam_signals, tmp_path):
+    """Close the gate when num_capture drops to frames already written."""
+    await start_capture(cam_signals, tmp_path / "a.zarr", 0)
+    await wait_for_value(cam_signals.out.captured, lambda n: n >= 2, timeout=5)
+    await cam_signals.num_capture.set(1)
+    await wait_for_value(cam_signals.capture, False, timeout=1)
+
+
+async def cancel_acquire(cam_signals, uni_core, monkeypatch) -> None:
+    """Cancel an `acquire=True` put while its core calls run."""
+    entered = threading.Event()
+    set_auto_shutter = uni_core.setAutoShutter
+
+    def slow_set_auto_shutter(state: bool) -> None:
+        entered.set()
+        time.sleep(0.1)
+        set_auto_shutter(state)
+
+    monkeypatch.setattr(uni_core, "setAutoShutter", slow_set_auto_shutter)
+    uni_core.setCameraDevice("Cam2")
+    status = cam_signals.acquire.set(True)
+    await asyncio.to_thread(entered.wait, 5)
+    status.task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await status
+
+
+async def test_cancelled_acquire_is_restored_on_close(
+    cam_signals, ctrl, uni_core, monkeypatch
+):
+    """Restore the camera and AutoShutter on close after a cancelled acquire put."""
+    await cancel_acquire(cam_signals, uni_core, monkeypatch)
+    ctrl.close()
+    assert uni_core.getCameraDevice() == "Cam2" and uni_core.getAutoShutter() is True
+    assert not uni_core.isSequenceRunning("Cam")
+
+
+async def test_cancelled_acquire_can_be_stopped(
+    cam_signals, ctrl, uni_core, monkeypatch
+):
+    """Stop a camera whose acquire put was cancelled, and let another camera acquire."""
+    await cancel_acquire(cam_signals, uni_core, monkeypatch)
+    assert await cam_signals.acquire.get_value() is True
+    await cam_signals.acquire.set(False)
+    cam2 = await acquire_signal(ctrl, "Cam2")
+    await cam2.set(True)
+    assert uni_core.isSequenceRunning("Cam2")
 
 
 async def test_colour_camera_is_refused(ctrl_with_rgb, tmp_path):
@@ -211,10 +297,13 @@ def test_camera_io_refuses_other_physical_cameras(ctrl):
         ctrl.camera_io("Pair", ("Cam",))
 
 
-async def test_write_error_faults_the_camera(cam_signals, monkeypatch, tmp_path):
-    """Fault the camera with the error message when a frame cannot be written."""
+async def test_write_error_faults_the_camera(
+    cam_signals, uni_core, monkeypatch, tmp_path
+):
+    """Fault the camera and stop its sequence when a frame cannot be written."""
     monkeypatch.setattr("ophyd_mmcore._camera_io.FrameStore.append", raising_append)
     await start_capture(cam_signals, tmp_path / "a.zarr", 3)
     await wait_for_value(cam_signals.capture, False, timeout=5)
     assert await cam_signals.state.get_value() == CameraState.FAULTED
     assert "disk full" in await cam_signals.last_error.get_value()
+    await wait_until(lambda: not uni_core.isSequenceRunning("Cam"))
