@@ -1,5 +1,6 @@
 import asyncio
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, ParamSpec, TypeVar
@@ -18,10 +19,13 @@ EventKey = tuple[str, str]
 
 @dataclass
 class Subscription:
-    """A callback to run on the loop that was running when it subscribed."""
+    """A callback to run on the loop that was running when it subscribed.
+
+    The callback receives the value and the time the event arrived.
+    """
 
     loop: asyncio.AbstractEventLoop
-    callback: Callable[[Any], None]
+    callback: Callable[[Any, float], None]
     active: bool = True
 
     def deliver(self, value: Any) -> None:
@@ -29,13 +33,13 @@ class Subscription:
         if not self.active:
             return
         try:
-            self.loop.call_soon_threadsafe(self._run, value)
+            self.loop.call_soon_threadsafe(self._run, value, time.time())
         except RuntimeError:
             self.active = False
 
-    def _run(self, value: Any) -> None:
+    def _run(self, value: Any, timestamp: float) -> None:
         if self.active:
-            self.callback(value)
+            self.callback(value, timestamp)
 
 
 class MMController:
@@ -45,7 +49,6 @@ class MMController:
         self._core = core
         self._lock = threading.Lock()
         self._subscriptions: dict[EventKey, list[Subscription]] = {}
-        self._property_types: dict[EventKey, type] = {}
         self._closed = False
         events = core.events
         self._connections: list[tuple[Any, Callable[..., None]]] = [
@@ -69,9 +72,9 @@ class MMController:
         return await asyncio.to_thread(fn, *args, **kwargs)
 
     def subscribe(
-        self, key: EventKey, callback: Callable[[Any], None]
+        self, key: EventKey, callback: Callable[[Any, float], None]
     ) -> Callable[[], None]:
-        """Run `callback` on the running loop for each event with `key`.
+        """Run `callback(value, timestamp)` on the running loop for each event with `key`.
 
         Returns the function that cancels the subscription. An event that
         arrives after cancelling, after `close` or after the loop closed is
@@ -95,19 +98,17 @@ class MMController:
         """Return the source of a device property, `mmcore://<label>/<prop>`."""
         key = (label, prop)
 
-        def property_type() -> type:
-            if key not in self._property_types:
-                match self._core.getPropertyType(label, prop):
-                    case PropertyType.Float:
-                        self._property_types[key] = float
-                    case PropertyType.Integer:
-                        self._property_types[key] = int
-                    case _:
-                        self._property_types[key] = str
-            return self._property_types[key]
-
         def get() -> Any:
-            return property_type()(self._core.getProperty(label, prop))
+            return self._core.getProperty(label, prop)
+
+        def property_type() -> type:
+            match self._core.getPropertyType(label, prop):
+                case PropertyType.Float:
+                    return float
+                case PropertyType.Integer:
+                    return int
+                case _:
+                    return str
 
         def set_(value: Any) -> None:
             self._core.setProperty(label, prop, value)
@@ -137,14 +138,11 @@ class MMController:
         async def describe() -> SignalMetadata:
             return await self.call(metadata)
 
-        def subscribe(callback: Callable[[Any], None]) -> Callable[[], None]:
-            return self.subscribe(key, lambda raw: callback(property_type()(raw)))
-
         return MMSource(
             uri=f"mmcore://{label}/{prop}",
             read=read,
             write=write,
-            subscribe=subscribe,
+            subscribe=lambda callback: self.subscribe(key, callback),
             infer=infer,
             metadata=describe,
         )

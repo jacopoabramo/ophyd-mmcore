@@ -1,8 +1,9 @@
 import asyncio
+import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Generic, TypeVar
+from typing import Any, Generic, TypeVar
 
 from bluesky.protocols import Reading
 from event_model import DataKey
@@ -18,16 +19,22 @@ from ophyd_async.core import (
 
 T = TypeVar("T")
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True)
 class MMSource(Generic[T]):
-    """How a signal reads, writes and monitors one value of the core."""
+    """How a signal reads, writes and monitors one value of the core.
+
+    `subscribe` takes a callback that receives each new value and the time it
+    arrived, and returns the function that cancels the subscription.
+    """
 
     uri: str
     read: Callable[[], Awaitable[T]]
     write: Callable[[T], Awaitable[None]] | None = None
     setpoint: Callable[[], Awaitable[T]] | None = None
-    subscribe: Callable[[Callable[[T], None]], Callable[[], None]] | None = None
+    subscribe: Callable[[Callable[[T, float], None]], Callable[[], None]] | None = None
     infer: Callable[[], Awaitable[type[T]]] | None = None
     metadata: Callable[[], Awaitable[SignalMetadata]] | None = None
 
@@ -69,7 +76,15 @@ class MMSignalBackend(SignalBackend[SignalDatatypeT]):
             if source.infer is None:
                 raise RuntimeError(f"{source.uri} has no datatype and cannot infer one")
             self.datatype = await source.infer()
-        await source.read()
+        await self.get_value()
+
+    def _convert(self, value: Any) -> Any:
+        datatype: Any = self.datatype
+        if not isinstance(datatype, type) or isinstance(value, datatype):
+            return value
+        if datatype is bool and isinstance(value, str):
+            return value.strip().lower() in ("1", "true")
+        return datatype(value)
 
     async def put(self, value: SignalDatatypeT | None) -> None:
         source = self._bound()
@@ -84,22 +99,22 @@ class MMSignalBackend(SignalBackend[SignalDatatypeT]):
         metadata = (
             SignalMetadata() if bound.metadata is None else await bound.metadata()
         )
-        value = await bound.read()
+        value = await self.get_value()
         return make_datakey(self.datatype or type(value), value, source, metadata)
 
     async def get_reading(self) -> Reading[SignalDatatypeT]:
         return Reading(
-            value=await self._bound().read(), timestamp=time.time(), alarm_severity=0
+            value=await self.get_value(), timestamp=time.time(), alarm_severity=0
         )
 
     async def get_value(self) -> SignalDatatypeT:
-        return await self._bound().read()
+        return self._convert(await self._bound().read())
 
     async def get_setpoint(self) -> SignalDatatypeT:
         source = self._bound()
         if source.setpoint is None:
-            return await source.read()
-        return await source.setpoint()
+            return await self.get_value()
+        return self._convert(await source.setpoint())
 
     def set_callback(self, callback: Callback[Reading[SignalDatatypeT]] | None) -> None:
         if callback is None:
@@ -108,21 +123,28 @@ class MMSignalBackend(SignalBackend[SignalDatatypeT]):
         if self._unsubscribe is not None:
             raise RuntimeError("Cannot set a callback when one is already set")
         source = self._bound()
-        if source.subscribe is None:
-            raise RuntimeError(f"{source.uri} cannot be monitored")
         event_seen = False
 
-        def deliver(value: SignalDatatypeT) -> None:
+        def deliver(value: Any, timestamp: float) -> None:
             nonlocal event_seen
             event_seen = True
-            callback(Reading(value=value, timestamp=time.time(), alarm_severity=0))
+            callback(
+                Reading(
+                    value=self._convert(value), timestamp=timestamp, alarm_severity=0
+                )
+            )
 
         async def deliver_current() -> None:
-            value = await source.read()
+            try:
+                value = await source.read()
+            except Exception:
+                logger.exception("Initial read of %s failed", source.uri)
+                return
             if not event_seen:
-                deliver(value)
+                deliver(value, time.time())
 
-        self._unsubscribe = source.subscribe(deliver)
+        subscribe = source.subscribe or (lambda _: lambda: None)
+        self._unsubscribe = subscribe(deliver)
         self._initial = asyncio.get_running_loop().create_task(deliver_current())
 
     def _stop(self) -> None:
