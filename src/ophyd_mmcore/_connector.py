@@ -195,7 +195,7 @@ class MMConnector(DeviceConnector):
                     backend.bind(self.ctrl.property_source(self.label, name))
                 case Position():
                     backend.bind(
-                        self.ctrl.position_source(self.label, self.axis or "z")  # pyright: ignore[reportArgumentType]
+                        self.ctrl.position_source(self.label, self.axis or "z")
                     )
                 case _:
                     raise TypeError(f"{marker!r} does not fit a Signal")

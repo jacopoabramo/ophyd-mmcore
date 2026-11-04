@@ -57,7 +57,7 @@ class MMSignalBackend(SignalBackend[SignalDatatypeT]):
         self._unsubscribe: Callable[[], None] | None = None
         self._initial: asyncio.Task[None] | None = None
 
-    def bind(self, source: MMSource[SignalDatatypeT]) -> None:
+    def bind(self, source: MMSource[Any]) -> None:
         """Set the source the backend reads and writes."""
         self._source = source
 

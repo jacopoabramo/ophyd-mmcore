@@ -1,7 +1,7 @@
 from collections.abc import Sequence
 from functools import cached_property
 from typing import Annotated as A
-from typing import Literal, cast
+from typing import Literal
 
 from ophyd_async.core import SignalRW, TriggerableCommand
 from ophyd_async.core import StandardReadableFormat as Format
@@ -20,7 +20,13 @@ def stage_connector(
     connector: MMConnector | None,
 ) -> tuple[str, MMController | None, Sequence[str], MMConnector | None]:
     """Return the arguments for `MMDevice`, with the stage options put into a connector."""
-    if connector is not None or ctrl is None:
+    if connector is not None:
+        if axis is not None or properties or move_timeout != 10.0:
+            raise ValueError(
+                "A device given a connector takes no axis, properties or move_timeout"
+            )
+        return label, ctrl, properties, connector
+    if ctrl is None:
         return label, ctrl, properties, connector
     return (
         "",
@@ -38,8 +44,8 @@ class MMAxis(MMMovable[float], MMDevice):
     A put on `position` returns when Micro-Manager reports the stage idle, and
     `halt` stops the stage. `axis` is `"x"` or `"y"` for an axis of an XY
     stage, and `None` for a one-axis stage. `move_timeout` is the seconds a
-    move may take, and `None` disables the limit. `axis` and `move_timeout`
-    apply only when the device is not given a `connector`.
+    move may take, and `None` disables the limit. `axis`, `properties` and
+    `move_timeout` cannot be combined with a `connector`.
     """
 
     position: A[SignalRW[float], Position(), Format.HINTED_SIGNAL]
@@ -70,7 +76,7 @@ class MMAxis(MMMovable[float], MMDevice):
             setpoint=self.position,
             readback=self.position,
             halt=self.halt,
-            move_timeout=cast("MMConnector", self._connector).move_timeout,
+            move_timeout=self._mm_connector.move_timeout,
         )
 
 

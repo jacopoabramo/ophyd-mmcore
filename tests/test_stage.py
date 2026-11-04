@@ -3,7 +3,8 @@ import asyncio
 import pytest
 from ophyd_async.core import init_devices
 
-from ophyd_mmcore import MMXYStage, MMZStage
+from ophyd_mmcore import MMAxis, MMXYStage, MMZStage
+from ophyd_mmcore._connector import MMConnector
 
 
 async def test_z_move_waits_for_idle(ctrl):
@@ -15,13 +16,12 @@ async def test_z_move_waits_for_idle(ctrl):
     assert (await z.read()).keys() == {"z"}
 
 
-async def test_concurrent_xy_axis_moves_both_land(ctrl):
+async def test_concurrent_xy_axis_moves_both_land(ctrl, uni_core):
     """Move both XY axes at once and land at both targets."""
     async with init_devices():
         xy = MMXYStage("XY", ctrl)
     await asyncio.gather(xy.x.set(1.0), xy.y.set(2.0))
-    assert await xy.x.position.get_value() == 1.0
-    assert await xy.y.position.get_value() == 2.0
+    assert tuple(uni_core.getXYPosition("XY")) == (1.0, 2.0)
 
 
 async def test_rejected_move_keeps_previous_setpoint(ctrl):
@@ -61,3 +61,35 @@ async def test_move_longer_than_move_timeout_fails(ctrl):
         z = MMZStage("Z", ctrl, move_timeout=0.001)
     with pytest.raises(TimeoutError):
         await z.set(1.0)
+
+
+async def test_position_follows_the_hardware_and_setpoint_keeps_the_target(
+    ctrl, uni_core
+):
+    """Read the hardware position after an outside move while the setpoint stays."""
+    async with init_devices():
+        z = MMZStage("Z", ctrl)
+    await z.set(5.0)
+    uni_core.setPosition("Z", 77.0)
+    assert await z.position.get_value() == 77.0
+    assert await z.locate() == {"setpoint": 5.0, "readback": 77.0}
+
+
+async def test_rejected_move_reads_hardware_and_previous_target(ctrl, uni_core):
+    """Report the hardware as the readback and the previous target as the setpoint."""
+    async with init_devices():
+        z = MMZStage("Z", ctrl)
+    await z.set(5.0)
+    uni_core.setPosition("Z", 77.0)
+    with pytest.raises(ValueError):
+        await z.set(5000.0)
+    assert await z.locate() == {"setpoint": 5.0, "readback": 77.0}
+
+
+@pytest.mark.parametrize(
+    "options", [{"axis": "x"}, {"properties": ["Name"]}, {"move_timeout": 3.0}]
+)
+def test_connector_excludes_stage_options(bare_ctrl, options):
+    """Refuse a stage given a connector together with an option the connector holds."""
+    with pytest.raises(ValueError):
+        MMAxis(connector=MMConnector(bare_ctrl, "Z"), **options)

@@ -170,7 +170,8 @@ class MMController:
 
         async def read() -> float:
             position = await self.call(getters[axis], label)
-            return self._targets.setdefault((label, axis), position)
+            self._targets.setdefault((label, axis), position)
+            return position
 
         async def setpoint() -> float:
             if (label, axis) not in self._targets:

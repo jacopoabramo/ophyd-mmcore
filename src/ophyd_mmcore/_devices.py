@@ -48,6 +48,7 @@ class MMDevice(StandardReadable):
         else:
             connector = MMConnector(ctrl, label, properties=properties)
         self._label = connector.label
+        self._mm_connector = connector
         super().__init__(name=name, connector=connector)
         signals: dict[str, SignalRW] = {}
         raw_names: dict[str, str] = {}
