@@ -1,5 +1,7 @@
 import asyncio
-from collections.abc import Sequence
+import contextlib
+import inspect
+from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated as A
@@ -19,6 +21,8 @@ from ophyd_async.core import (
     StreamResourceDataProvider,
     StreamResourceInfo,
     TriggerInfo,
+    WatchableAsyncStatus,
+    WatcherUpdate,
     wait_for_value,
 )
 
@@ -242,3 +246,46 @@ class MMCamera(StandardDetector):
                 for key, output in outputs.items()
             ),
         )
+
+    @contextlib.asynccontextmanager
+    async def raise_on_fault(self) -> AsyncGenerator[None, None]:
+        """Stop the block as soon as the camera faults.
+
+        Raises
+        ------
+        RuntimeError
+            With the camera's last error, if the camera faults.
+        """
+        scope = asyncio.timeout(None)
+
+        async def expire_on_fault() -> None:
+            await wait_for_value(self.state, CameraState.FAULTED, timeout=None)
+            scope.reschedule(asyncio.get_running_loop().time())
+
+        try:
+            async with scope:
+                watcher = asyncio.ensure_future(expire_on_fault())
+                try:
+                    yield
+                finally:
+                    watcher.cancel()
+        except TimeoutError:
+            if not scope.expired():
+                raise
+            raise RuntimeError(await self.last_error.get_value()) from None
+
+    # The base methods are unwrapped so that their own watcher updates pass
+    # through unchanged while the fault scope runs in the same task.
+    @WatchableAsyncStatus.wrap
+    async def trigger(self) -> AsyncIterator[WatcherUpdate[int]]:
+        """Take one collection, failing with the camera's last error if it faults."""
+        async with self.raise_on_fault():
+            async for update in inspect.unwrap(StandardDetector.trigger)(self):
+                yield update
+
+    @WatchableAsyncStatus.wrap
+    async def complete(self) -> AsyncIterator[WatcherUpdate[int]]:
+        """Wait for the kicked-off collections, failing with the camera's last error if it faults."""
+        async with self.raise_on_fault():
+            async for update in inspect.unwrap(StandardDetector.complete)(self):
+                yield update

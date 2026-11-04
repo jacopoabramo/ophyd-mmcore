@@ -1,4 +1,6 @@
+import asyncio
 from collections import defaultdict
+from pathlib import Path
 from typing import Annotated as A
 
 import bluesky.plans as bp
@@ -13,7 +15,7 @@ from ophyd_async.core import (
     set_mock_value,
 )
 
-from ophyd_mmcore import CameraState, Label, MMCamera, MMSystem
+from ophyd_mmcore import CameraState, Label, MMCamera, MMController, MMSystem
 
 
 async def test_prepare_names_the_store(bare_ctrl, tmp_path):
@@ -67,12 +69,12 @@ def test_count_emits_stream_documents(ctrl, tmp_path):
     )
 
 
-async def test_fault_raises_at_wait_for_idle(bare_ctrl, tmp_path):
-    """Raise the camera's last error when it faults during a capture."""
+async def faulting_camera(ctrl: MMController, tmp_path: Path) -> MMCamera:
+    """Return a mock camera that faults with "boom" when its capture starts."""
     async with init_devices(mock=True):
         cam = MMCamera(
             "Cam",
-            bare_ctrl,
+            ctrl,
             path_provider=StaticPathProvider(UUIDFilenameProvider(), tmp_path),
         )
 
@@ -80,14 +82,29 @@ async def test_fault_raises_at_wait_for_idle(bare_ctrl, tmp_path):
         if value:
             set_mock_value(cam.state, CameraState.FAULTED)
             set_mock_value(cam.last_error, "boom")
-            # The frame is counted, so the trigger reaches wait_for_idle.
-            set_mock_value(cam.outputs["cam"].captured, 1)
         return False
 
     callback_on_mock_put(cam.capture, fault)
     await cam.stage()
-    with pytest.raises(RuntimeError, match="boom"):
-        await cam.trigger()
+    return cam
+
+
+async def test_trigger_raises_fault(bare_ctrl, tmp_path):
+    """Fail a trigger with the camera's last error as soon as the camera faults."""
+    cam = await faulting_camera(bare_ctrl, tmp_path)
+    async with asyncio.timeout(2):
+        with pytest.raises(RuntimeError, match="boom"):
+            await cam.trigger()
+
+
+async def test_complete_raises_fault(bare_ctrl, tmp_path):
+    """Fail a fly scan's complete with the camera's last error as soon as the camera faults."""
+    cam = await faulting_camera(bare_ctrl, tmp_path)
+    await cam.prepare(TriggerInfo(number_of_events=2))
+    await cam.kickoff()
+    async with asyncio.timeout(2):
+        with pytest.raises(RuntimeError, match="boom"):
+            await cam.complete()
 
 
 class Rig(MMSystem):
