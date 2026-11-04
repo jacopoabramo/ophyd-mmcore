@@ -30,6 +30,27 @@ from ._connector import (
 from ._controller import MMController
 
 
+def property_map(connector: MMConnector) -> DeviceMap[SignalRW]:
+    """Return a signal for each of the connector's properties, keyed by its cleaned name.
+
+    Raises
+    ------
+    ValueError
+        If two properties have the same cleaned name.
+    """
+    signals: dict[str, SignalRW] = {}
+    raw_names: dict[str, str] = {}
+    for prop in connector.properties:
+        key = clean_name(prop)
+        if key in signals:
+            raise ValueError(
+                f"Properties {raw_names[key]!r} and {prop!r} both become {key!r}"
+            )
+        raw_names[key] = prop
+        signals[key] = SignalRW(connector.property_backend(prop))
+    return DeviceMap(signals)
+
+
 class MMDevice(StandardReadable):
     """A Micro-Manager device, addressed by its label.
 
@@ -61,18 +82,8 @@ class MMDevice(StandardReadable):
         self._label = connector.label
         self._mm_connector = connector
         super().__init__(name=name, connector=connector)
-        signals: dict[str, SignalRW] = {}
-        raw_names: dict[str, str] = {}
-        for prop in connector.properties:
-            key = clean_name(prop)
-            if key in signals:
-                raise ValueError(
-                    f"Properties {raw_names[key]!r} and {prop!r} both become {key!r}"
-                )
-            raw_names[key] = prop
-            signals[key] = SignalRW(connector.property_backend(prop))
         with self.add_children_as_readables(Format.CONFIG_SIGNAL):
-            self.properties = DeviceMap(signals)
+            self.properties = property_map(connector)
 
     @property
     def label(self) -> str:

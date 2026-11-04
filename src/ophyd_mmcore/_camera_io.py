@@ -19,6 +19,16 @@ if TYPE_CHECKING:
 SEQUENCE_LENGTH: Final = 2**31 - 1
 """The number of frames a sequence asks for, the largest Micro-Manager accepts."""
 
+CameraValueName = Literal[
+    "exposure", "acquire", "capture", "num_capture", "state", "last_error"
+]
+"""The camera values a [`CameraIO`][ophyd_mmcore._camera_io.CameraIO] serves."""
+
+OutputValueName = Literal[
+    "width", "height", "dtype_numpy", "file_path", "data_key", "captured"
+]
+"""The values of one output a [`CameraIO`][ophyd_mmcore._camera_io.CameraIO] serves."""
+
 T = TypeVar("T")
 
 logger = logging.getLogger(__name__)
@@ -164,12 +174,7 @@ class CameraIO:
     def _running(self) -> bool:
         return self._values["acquire"] and not self._faulted
 
-    def source(
-        self,
-        name: Literal[
-            "exposure", "acquire", "capture", "num_capture", "state", "last_error"
-        ],
-    ) -> MMSource[Any]:
+    def source(self, name: CameraValueName) -> MMSource[Any]:
         """Return the source of the camera's exposure or one of its flags."""
         if name == "exposure":
             return self._exposure_source()
@@ -190,13 +195,7 @@ class CameraIO:
             subscribe=lambda callback: self._ctrl.subscribe(key, callback),
         )
 
-    def output_source(
-        self,
-        physical: str,
-        name: Literal[
-            "width", "height", "dtype_numpy", "file_path", "data_key", "captured"
-        ],
-    ) -> MMSource[Any]:
+    def output_source(self, physical: str, name: OutputValueName) -> MMSource[Any]:
         """Return the source of a frame layout value or of the store of one output.
 
         Raises

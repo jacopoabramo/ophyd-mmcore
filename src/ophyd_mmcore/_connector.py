@@ -15,6 +15,7 @@ from ophyd_async.core import (
 )
 
 from ._backend import MMCommandBackend, MMSignalBackend
+from ._camera_io import CameraValueName, OutputValueName
 from ._controller import MMController
 
 
@@ -71,7 +72,29 @@ class XYAxis:
     axis: Literal["x", "y"]
 
 
-SIGNAL_MARKERS = (Property, Position, ShutterOpen, StateLabel, Preset)
+@dataclass(frozen=True)
+class CameraValue:
+    """Mark the camera's exposure or one of its sequence flags."""
+
+    name: CameraValueName
+
+
+@dataclass(frozen=True)
+class OutputValue:
+    """Mark a frame layout value or a store signal of the connector's output."""
+
+    name: OutputValueName
+
+
+SIGNAL_MARKERS = (
+    Property,
+    Position,
+    ShutterOpen,
+    StateLabel,
+    Preset,
+    CameraValue,
+    OutputValue,
+)
 COMMAND_MARKERS = (Halt,)
 DEVICE_MARKERS = (Label, XYAxis)
 MARKERS = SIGNAL_MARKERS + COMMAND_MARKERS + DEVICE_MARKERS
@@ -222,6 +245,16 @@ class MMConnector(DeviceConnector):
                     backend.bind(self.ctrl.state_source(self.label))
                 case Preset():
                     backend.bind(self.ctrl.preset_source(self.label))
+                case CameraValue(name):
+                    backend.bind(
+                        self.ctrl.camera_io(self.label, self.physical).source(name)
+                    )
+                case OutputValue(name) if self.output is not None:
+                    backend.bind(
+                        self.ctrl.camera_io(self.label, self.physical).output_source(
+                            self.output, name
+                        )
+                    )
                 case _:
                     raise TypeError(f"{marker!r} does not fit a Signal")
         for backend, extras in self.filler.create_commands_from_annotations():
