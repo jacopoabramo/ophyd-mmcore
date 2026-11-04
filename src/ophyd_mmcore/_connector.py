@@ -45,6 +45,21 @@ class Position:
 
 
 @dataclass(frozen=True)
+class ShutterOpen:
+    """Mark the signal that is true when the shutter of the label is open."""
+
+
+@dataclass(frozen=True)
+class StateLabel:
+    """Mark the signal holding the label of the current state of the device."""
+
+
+@dataclass(frozen=True)
+class Preset:
+    """Mark the signal holding the current preset of the configuration group named by the label."""
+
+
+@dataclass(frozen=True)
 class Halt:
     """Mark the command that stops the device's label."""
 
@@ -56,7 +71,7 @@ class XYAxis:
     axis: Literal["x", "y"]
 
 
-SIGNAL_MARKERS = (Property, Position)
+SIGNAL_MARKERS = (Property, Position, ShutterOpen, StateLabel, Preset)
 COMMAND_MARKERS = (Halt,)
 DEVICE_MARKERS = (Label, XYAxis)
 MARKERS = SIGNAL_MARKERS + COMMAND_MARKERS + DEVICE_MARKERS
@@ -172,7 +187,7 @@ class MMConnector(DeviceConnector):
                 raise TypeError(
                     f"{where}: {type(marker).__name__} does not fit a {origin.__name__}"
                 )
-            if isinstance(marker, Property | Position | Halt) and not self.label:
+            if isinstance(marker, SIGNAL_MARKERS + COMMAND_MARKERS) and not self.label:
                 raise TypeError(
                     f"{where}: {type(marker).__name__} needs a device with a label"
                 )
@@ -197,6 +212,12 @@ class MMConnector(DeviceConnector):
                     backend.bind(
                         self.ctrl.position_source(self.label, self.axis or "z")
                     )
+                case ShutterOpen():
+                    backend.bind(self.ctrl.shutter_source(self.label))
+                case StateLabel():
+                    backend.bind(self.ctrl.state_source(self.label))
+                case Preset():
+                    backend.bind(self.ctrl.preset_source(self.label))
                 case _:
                     raise TypeError(f"{marker!r} does not fit a Signal")
         for backend, extras in self.filler.create_commands_from_annotations():

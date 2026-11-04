@@ -8,34 +8,7 @@ from ophyd_async.core import StandardReadableFormat as Format
 
 from ._connector import Halt, MMConnector, Position, XYAxis
 from ._controller import MMController
-from ._devices import MMDevice, MMMovable, MMMoveLogic
-
-
-def stage_connector(
-    label: str,
-    ctrl: MMController | None,
-    axis: Literal["x", "y"] | None,
-    properties: Sequence[str],
-    move_timeout: float | None,
-    connector: MMConnector | None,
-) -> tuple[str, MMController | None, Sequence[str], MMConnector | None]:
-    """Return the arguments for `MMDevice`, with the stage options put into a connector."""
-    if connector is not None:
-        if axis is not None or properties or move_timeout != 10.0:
-            raise ValueError(
-                "A device given a connector takes no axis, properties or move_timeout"
-            )
-        return label, ctrl, properties, connector
-    if ctrl is None:
-        return label, ctrl, properties, connector
-    return (
-        "",
-        None,
-        (),
-        MMConnector(
-            ctrl, label, axis=axis, properties=properties, move_timeout=move_timeout
-        ),
-    )
+from ._devices import MMDevice, MMMovable, MMMoveLogic, movable_connector
 
 
 class MMAxis(MMMovable[float], MMDevice):
@@ -62,7 +35,7 @@ class MMAxis(MMMovable[float], MMDevice):
         name: str = "",
         connector: MMConnector | None = None,
     ) -> None:
-        label, ctrl, properties, connector = stage_connector(
+        label, ctrl, properties, connector = movable_connector(
             label, ctrl, axis, properties, move_timeout, connector
         )
         super().__init__(
@@ -123,7 +96,7 @@ class MMXYStage(MMDevice):
         name: str = "",
         connector: MMConnector | None = None,
     ) -> None:
-        label, ctrl, properties, connector = stage_connector(
+        label, ctrl, properties, connector = movable_connector(
             label, ctrl, None, properties, move_timeout, connector
         )
         super().__init__(

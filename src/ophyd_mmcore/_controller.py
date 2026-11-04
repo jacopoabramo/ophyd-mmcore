@@ -13,6 +13,7 @@ from ._backend import MMSource
 
 P = ParamSpec("P")
 R = TypeVar("R")
+T = TypeVar("T")
 
 EventKey = tuple[str, str]
 
@@ -50,7 +51,7 @@ class MMController:
         self._lock = threading.Lock()
         self._subscriptions: dict[EventKey, list[Subscription]] = {}
         self._closed = False
-        self._targets: dict[tuple[str, str], float] = {}
+        self._targets: dict[tuple[str, str], Any] = {}
         self._xy_locks: dict[str, asyncio.Lock] = {}
         events = core.events
         self._connections: list[tuple[Any, Callable[..., None]]] = [
@@ -179,16 +180,7 @@ class MMController:
             return self._targets[label, axis]
 
         async def store_and_move(value: float, move: Callable[[], None]) -> None:
-            previous = self._targets.get((label, axis))
-            self._targets[label, axis] = value
-            try:
-                await self.call(move)
-            except Exception:
-                if previous is None:
-                    del self._targets[label, axis]
-                else:
-                    self._targets[label, axis] = previous
-                raise
+            await self._store_and_move((label, axis), value, move)
 
         async def write(value: float) -> None:
             if axis == "z":
@@ -221,6 +213,107 @@ class MMController:
                 (label, f"core:{name}"), callback
             ),
             metadata=metadata,
+        )
+
+    async def _store_and_move(
+        self, key: tuple[str, str], value: Any, move: Callable[[], None]
+    ) -> None:
+        previous = self._targets.get(key)
+        self._targets[key] = value
+        try:
+            await self.call(move)
+        except Exception:
+            if previous is None:
+                del self._targets[key]
+            else:
+                self._targets[key] = previous
+            raise
+
+    def _moving_source(
+        self,
+        uri: str,
+        key: tuple[str, str],
+        get: Callable[[], T],
+        move: Callable[[T], None],
+        wait: Callable[[T], None],
+        event: EventKey,
+        metadata: Callable[[], SignalMetadata] | None = None,
+    ) -> MMSource[T]:
+        async def read() -> T:
+            value = await self.call(get)
+            self._targets.setdefault(key, value)
+            return value
+
+        async def setpoint() -> T:
+            if key not in self._targets:
+                await read()
+            return self._targets[key]
+
+        async def write(value: T) -> None:
+            await self._store_and_move(key, value, lambda: move(value))
+            await self.call(wait, value)
+
+        async def describe() -> SignalMetadata:
+            return SignalMetadata() if metadata is None else await self.call(metadata)
+
+        return MMSource(
+            uri=uri,
+            read=read,
+            write=write,
+            setpoint=setpoint,
+            subscribe=lambda callback: self.subscribe(event, callback),
+            metadata=describe,
+        )
+
+    def shutter_source(self, label: str) -> MMSource[bool]:
+        """Return the source of a shutter, true when open.
+
+        Writing opens or closes the shutter and returns when the device is
+        idle. `setpoint` reports the last target written, which starts at the
+        state at connect, and a write the core rejects leaves it as it was.
+        """
+        return self._moving_source(
+            f"mmcore://{label}/open",
+            (label, "open"),
+            lambda: self._core.getShutterOpen(label),
+            lambda value: self._core.setShutterOpen(label, value),
+            lambda value: self._core.waitForDevice(label),
+            (label, "core:open"),
+        )
+
+    def state_source(self, label: str) -> MMSource[str]:
+        """Return the source of a state device's label.
+
+        Writing moves to the state with that label and returns when the device
+        is idle. The labels of the device are the `choices` of its metadata.
+        `setpoint` behaves as it does for [`shutter_source`][ophyd_mmcore.MMController.shutter_source].
+        """
+        return self._moving_source(
+            f"mmcore://{label}/Label",
+            (label, "state"),
+            lambda: self._core.getStateLabel(label),
+            lambda value: self._core.setStateLabel(label, value),
+            lambda value: self._core.waitForDevice(label),
+            (label, "Label"),
+            lambda: SignalMetadata(choices=list(self._core.getStateLabels(label))),
+        )
+
+    def preset_source(self, group: str) -> MMSource[str]:
+        """Return the source of a configuration group's current preset.
+
+        Writing applies the preset and returns when every device it touches is
+        idle. Reading gives `""` when no preset matches the hardware. The
+        presets of the group are the `choices` of its metadata. `setpoint`
+        behaves as it does for [`shutter_source`][ophyd_mmcore.MMController.shutter_source].
+        """
+        return self._moving_source(
+            f"mmcore://{group}/preset",
+            (group, "preset"),
+            lambda: self._core.getCurrentConfig(group),
+            lambda value: self._core.setConfig(group, value),
+            lambda value: self._core.waitForConfig(group, value),
+            (group, "core:preset"),
+            lambda: SignalMetadata(choices=list(self._core.getAvailableConfigs(group))),
         )
 
     def halt(self, label: str) -> Callable[[], Awaitable[None]]:

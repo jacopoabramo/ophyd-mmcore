@@ -1,3 +1,4 @@
+import asyncio
 from typing import Annotated as A
 
 import pytest
@@ -5,7 +6,17 @@ from ophyd_async.core import Command, SignalR, SignalRW, init_devices
 from ophyd_async.core import StandardReadableFormat as Format
 from ophyd_async.testing import assert_reading, partial_reading
 
-from ophyd_mmcore import Label, MMDevice, MMSystem, Property
+from ophyd_mmcore import (
+    Label,
+    MMConfigGroup,
+    MMDevice,
+    MMShutter,
+    MMStateDevice,
+    MMSystem,
+    MMXYStage,
+    MMZStage,
+    Property,
+)
 from ophyd_mmcore._connector import MMConnector, clean_name
 
 
@@ -117,3 +128,77 @@ def test_device_needs_a_label_or_a_connector():
     """Refuse a device given neither a controller nor a connector."""
     with pytest.raises(ValueError):
         MMDevice("Wheel")
+
+
+async def test_shutter_opens(ctrl):
+    """Open the shutter and read it back as open."""
+    async with init_devices():
+        shutter = MMShutter("Shutter", ctrl)
+    await shutter.set(True)
+    assert await shutter.position.get_value() is True
+
+
+async def test_state_device_moves_by_label(ctrl):
+    """Move a state device by label and describe its labels as choices."""
+    async with init_devices():
+        wheel = MMStateDevice("Wheel", ctrl)
+    await wheel.set("C")
+    assert await wheel.position.get_value() == "C"
+    assert (await wheel.describe())["wheel"].get("choices") == ["A", "B", "C", "D"]
+
+
+async def test_config_group_applies_preset(ctrl, uni_core):
+    """Apply a preset and read it back, or an empty name when none matches."""
+    async with init_devices():
+        channel = MMConfigGroup("Channel", ctrl)
+    await channel.set("B")
+    assert await channel.position.get_value() == "B"
+    uni_core.setProperty("Wheel", "Label", "D")
+    assert await channel.position.get_value() == ""
+    assert await channel.locate() == {"setpoint": "B", "readback": ""}
+
+
+async def test_rejected_state_keeps_previous_target(ctrl):
+    """Keep the last target when the core refuses a state label."""
+    async with init_devices():
+        wheel = MMStateDevice("Wheel", ctrl)
+    await wheel.set("B")
+    with pytest.raises(Exception):
+        await wheel.set("Z")
+    assert await wheel.locate() == {"setpoint": "B", "readback": "B"}
+
+
+@pytest.mark.parametrize(
+    ("cls", "options"),
+    [
+        (MMShutter, {"properties": ["Name"]}),
+        (MMStateDevice, {"move_timeout": 3.0}),
+        (MMConfigGroup, {"move_timeout": 3.0}),
+    ],
+)
+def test_connector_excludes_options(bare_ctrl, cls, options):
+    """Refuse a device given a connector together with an option the connector holds."""
+    with pytest.raises(ValueError):
+        cls(connector=MMConnector(bare_ctrl, "Wheel"), **options)
+
+
+class Scope(MMSystem):
+    z: A[MMZStage, Label("Z"), Format.CHILD]
+    xy: A[MMXYStage, Label("XY")]
+    shutter: A[MMShutter, Label("Shutter")]
+    channel: A[MMConfigGroup, Label("Channel")]
+
+
+async def test_system_moves_declared_devices(ctrl):
+    """Move every kind of declared child of a system with the system's move timeout."""
+    async with init_devices():
+        scope = Scope(ctrl, move_timeout=5.0)
+    await asyncio.gather(
+        scope.z.set(4.0),
+        scope.xy.x.set(1.0),
+        scope.shutter.set(True),
+        scope.channel.set("B"),
+    )
+    assert (await scope.describe()).keys() == {"scope-z"}
+    assert await scope.xy.x.position.get_value() == 1.0
+    assert scope.xy.x.movable_logic.move_timeout == 5.0

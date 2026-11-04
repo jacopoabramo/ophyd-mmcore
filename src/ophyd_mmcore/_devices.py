@@ -1,5 +1,8 @@
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import cached_property
+from typing import Annotated as A
+from typing import Literal
 
 from bluesky.protocols import Location
 from ophyd_async.core import (
@@ -15,7 +18,14 @@ from ophyd_async.core import (
 )
 from ophyd_async.core import StandardReadableFormat as Format
 
-from ._connector import MMConnector, clean_name
+from ._connector import (
+    Halt,
+    MMConnector,
+    Preset,
+    ShutterOpen,
+    StateLabel,
+    clean_name,
+)
 from ._controller import MMController
 
 
@@ -123,3 +133,156 @@ class MMMovable(StandardMovable[SignalDatatypeT]):
     async def locate(self) -> Location[SignalDatatypeT]:
         """Return the stored target as the setpoint and the hardware value as the readback."""
         return await self.movable_logic.setpoint.locate()
+
+
+def movable_connector(
+    label: str,
+    ctrl: MMController | None,
+    axis: Literal["x", "y"] | None,
+    properties: Sequence[str],
+    move_timeout: float | None,
+    connector: MMConnector | None,
+) -> tuple[str, MMController | None, Sequence[str], MMConnector | None]:
+    """Return the arguments for `MMDevice`, with the options of a moving device put into a connector."""
+    if connector is not None:
+        if axis is not None or properties or move_timeout != 10.0:
+            raise ValueError(
+                "A device given a connector takes no axis, properties or move_timeout"
+            )
+        return label, ctrl, properties, connector
+    if ctrl is None:
+        return label, ctrl, properties, connector
+    return (
+        "",
+        None,
+        (),
+        MMConnector(
+            ctrl, label, axis=axis, properties=properties, move_timeout=move_timeout
+        ),
+    )
+
+
+class MMShutter(MMMovable[bool], MMDevice):
+    """A shutter, moved by setting it open or closed.
+
+    A put on `position` returns when Micro-Manager reports the shutter idle,
+    and `halt` stops it. `move_timeout` is the seconds a move may take, and
+    `None` disables the limit. `properties` and `move_timeout` cannot be
+    combined with a `connector`.
+    """
+
+    position: A[SignalRW[bool], ShutterOpen(), Format.HINTED_SIGNAL]
+    halt: A[TriggerableCommand, Halt()]
+
+    def __init__(
+        self,
+        label: str = "",
+        ctrl: MMController | None = None,
+        *,
+        properties: Sequence[str] = (),
+        move_timeout: float | None = 10.0,
+        name: str = "",
+        connector: MMConnector | None = None,
+    ) -> None:
+        label, ctrl, properties, connector = movable_connector(
+            label, ctrl, None, properties, move_timeout, connector
+        )
+        super().__init__(
+            label, ctrl, properties=properties, name=name, connector=connector
+        )
+
+    @cached_property
+    def movable_logic(self) -> MMMoveLogic[bool]:
+        """The move logic of the shutter, built from `position` and `halt`."""
+        return MMMoveLogic(
+            setpoint=self.position,
+            readback=self.position,
+            halt=self.halt,
+            move_timeout=self._mm_connector.move_timeout,
+        )
+
+
+class MMStateDevice(MMMovable[str], MMDevice):
+    """A device with named states, such as a filter wheel, moved by state label.
+
+    The labels of the device are the `choices` of the `position` signal. A put
+    on `position` returns when Micro-Manager reports the device idle, and
+    `halt` stops it. `move_timeout` is the seconds a move may take, and `None`
+    disables the limit. `properties` and `move_timeout` cannot be combined
+    with a `connector`.
+    """
+
+    position: A[SignalRW[str], StateLabel(), Format.HINTED_SIGNAL]
+    halt: A[TriggerableCommand, Halt()]
+
+    def __init__(
+        self,
+        label: str = "",
+        ctrl: MMController | None = None,
+        *,
+        properties: Sequence[str] = (),
+        move_timeout: float | None = 10.0,
+        name: str = "",
+        connector: MMConnector | None = None,
+    ) -> None:
+        label, ctrl, properties, connector = movable_connector(
+            label, ctrl, None, properties, move_timeout, connector
+        )
+        super().__init__(
+            label, ctrl, properties=properties, name=name, connector=connector
+        )
+
+    @cached_property
+    def movable_logic(self) -> MMMoveLogic[str]:
+        """The move logic of the device, built from `position` and `halt`."""
+        return MMMoveLogic(
+            setpoint=self.position,
+            readback=self.position,
+            halt=self.halt,
+            move_timeout=self._mm_connector.move_timeout,
+        )
+
+
+class MMConfigGroup(MMMovable[str], StandardReadable):
+    """A Micro-Manager configuration group, moved by preset name.
+
+    A put on `position` applies the preset and returns when every device it
+    touches is idle. `position` reads `""` when no preset matches the
+    hardware. A group has no `halt`, so `stop` returns at once. The presets
+    are the `choices` of the `position` signal. `move_timeout` is the seconds
+    a move may take, and `None` disables the limit. `move_timeout` cannot be
+    combined with a `connector`.
+    """
+
+    position: A[SignalRW[str], Preset(), Format.HINTED_SIGNAL]
+
+    def __init__(
+        self,
+        group: str = "",
+        ctrl: MMController | None = None,
+        *,
+        move_timeout: float | None = 10.0,
+        name: str = "",
+        connector: MMConnector | None = None,
+    ) -> None:
+        group, ctrl, _, connector = movable_connector(
+            group, ctrl, None, (), move_timeout, connector
+        )
+        if connector is None:
+            raise ValueError("MMConfigGroup needs either a ctrl or a connector")
+        if group or ctrl is not None:
+            raise ValueError(
+                "MMConfigGroup takes either a connector or a group and ctrl, not both"
+            )
+        self._mm_connector = connector
+        super().__init__(name=name, connector=connector)
+
+    @cached_property
+    def movable_logic(self) -> MMMoveLogic[str]:
+        """The move logic of the group, built from `position`."""
+        return MMMoveLogic(
+            setpoint=self.position,
+            readback=self.position,
+            halt=None,
+            move_timeout=self._mm_connector.move_timeout,
+        )
