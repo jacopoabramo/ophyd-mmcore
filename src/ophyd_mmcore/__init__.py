@@ -2,8 +2,17 @@
 
 from importlib.metadata import version
 
+from ._connector import Label, Property
 from ._controller import MMController
+from ._devices import MMDevice, MMSystem
 
 __version__ = version("ophyd-mmcore")
 
-__all__ = ["MMController", "__version__"]
+__all__ = [
+    "Label",
+    "MMController",
+    "MMDevice",
+    "MMSystem",
+    "Property",
+    "__version__",
+]
