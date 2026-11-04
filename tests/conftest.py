@@ -6,6 +6,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 import numpy as np
 import pytest
 from numpy.typing import DTypeLike
+from pymmcore_plus import CMMCorePlus
 from pymmcore_plus.experimental.unicore import (
     ShutterDevice,
     SimpleCameraDevice,
@@ -225,3 +226,40 @@ def bare_ctrl() -> Iterator[MMController]:
     controller = MMController(UniMMCore())
     yield controller
     controller.close()
+
+
+DEMO_SKIP = (
+    "Micro-Manager demo adapters not installed; run mmcore install --test-adapters"
+)
+
+
+@pytest.fixture
+def demo_ctrl() -> Iterator[MMController]:
+    """Return a controller on the Micro-Manager demo configuration."""
+    try:
+        controller = MMController.from_config("MMConfig_demo.cfg")
+    except Exception:
+        pytest.skip(DEMO_SKIP)
+    yield controller
+    controller.close()
+    controller.core.unloadAllDevices()
+
+
+@pytest.fixture
+def multi_ctrl() -> Iterator[MMController]:
+    """Return a controller on a core with a Multi Camera over two demo cameras."""
+    core = CMMCorePlus()
+    try:
+        core.loadDevice("Cam1", "DemoCamera", "DCam")
+        core.loadDevice("Cam2", "DemoCamera", "DCam")
+        core.loadDevice("Multi", "Utilities", "Multi Camera")
+        core.initializeAllDevices()
+    except Exception:
+        pytest.skip(DEMO_SKIP)
+    core.setProperty("Multi", "Physical Camera 1", "Cam1")
+    core.setProperty("Multi", "Physical Camera 2", "Cam2")
+    core.setCameraDevice("Multi")
+    controller = MMController(core)
+    yield controller
+    controller.close()
+    core.unloadAllDevices()
