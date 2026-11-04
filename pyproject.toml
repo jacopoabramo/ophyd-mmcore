@@ -13,6 +13,8 @@ authors = [
 requires-python = ">=3.11"
 dependencies = [
     "acquire-zarr>=0.10",
+    "bluesky>=1.14.6",
+    "event-model>=1.23.1",
     "ophyd-async>=0.21.3",
     "pymmcore-plus>=0.18.1,<0.19",
 ]
