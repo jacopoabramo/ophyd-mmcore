@@ -2,7 +2,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import cached_property
 from typing import Annotated as A
-from typing import Literal
+from typing import ClassVar, Literal
 
 from bluesky.protocols import Location
 from ophyd_async.core import (
@@ -22,6 +22,7 @@ from ._connector import (
     Halt,
     MMConnector,
     Preset,
+    Property,
     ShutterOpen,
     StateLabel,
     clean_name,
@@ -254,6 +255,7 @@ class MMConfigGroup(MMMovable[str], StandardReadable):
     combined with a `connector`.
     """
 
+    refused_markers: ClassVar[tuple[type, ...]] = (Property, Halt)
     position: A[SignalRW[str], Preset(), Format.HINTED_SIGNAL]
 
     def __init__(

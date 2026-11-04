@@ -236,7 +236,7 @@ class MMController:
         get: Callable[[], T],
         move: Callable[[T], None],
         wait: Callable[[T], None],
-        event: EventKey,
+        events: dict[EventKey, Callable[[Any], T] | None],
         metadata: Callable[[], SignalMetadata] | None = None,
     ) -> MMSource[T]:
         async def read() -> T:
@@ -256,12 +256,31 @@ class MMController:
         async def describe() -> SignalMetadata:
             return SignalMetadata() if metadata is None else await self.call(metadata)
 
+        def subscribe(callback: Callable[[T, float], None]) -> Callable[[], None]:
+            cancels = [
+                self.subscribe(
+                    key,
+                    callback
+                    if convert is None
+                    else lambda value, time, convert=convert: callback(
+                        convert(value), time
+                    ),
+                )
+                for key, convert in events.items()
+            ]
+
+            def cancel() -> None:
+                for cancel_one in cancels:
+                    cancel_one()
+
+            return cancel
+
         return MMSource(
             uri=uri,
             read=read,
             write=write,
             setpoint=setpoint,
-            subscribe=lambda callback: self.subscribe(event, callback),
+            subscribe=subscribe,
             metadata=describe,
         )
 
@@ -278,7 +297,10 @@ class MMController:
             lambda: self._core.getShutterOpen(label),
             lambda value: self._core.setShutterOpen(label, value),
             lambda value: self._core.waitForDevice(label),
-            (label, "core:open"),
+            {
+                (label, "core:open"): None,
+                (label, "State"): lambda value: bool(int(value)),
+            },
         )
 
     def state_source(self, label: str) -> MMSource[str]:
@@ -294,7 +316,7 @@ class MMController:
             lambda: self._core.getStateLabel(label),
             lambda value: self._core.setStateLabel(label, value),
             lambda value: self._core.waitForDevice(label),
-            (label, "Label"),
+            {(label, "Label"): None},
             lambda: SignalMetadata(choices=list(self._core.getStateLabels(label))),
         )
 
@@ -312,7 +334,7 @@ class MMController:
             lambda: self._core.getCurrentConfig(group),
             lambda value: self._core.setConfig(group, value),
             lambda value: self._core.waitForConfig(group, value),
-            (group, "core:preset"),
+            {(group, "core:preset"): None},
             lambda: SignalMetadata(choices=list(self._core.getAvailableConfigs(group))),
         )
 

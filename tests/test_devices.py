@@ -2,9 +2,15 @@ import asyncio
 from typing import Annotated as A
 
 import pytest
-from ophyd_async.core import Command, SignalR, SignalRW, init_devices
+from ophyd_async.core import (
+    Command,
+    SignalR,
+    SignalRW,
+    TriggerableCommand,
+    init_devices,
+)
 from ophyd_async.core import StandardReadableFormat as Format
-from ophyd_async.testing import assert_reading, partial_reading
+from ophyd_async.testing import MonitorQueue, assert_reading, partial_reading
 
 from ophyd_mmcore import (
     Label,
@@ -17,7 +23,7 @@ from ophyd_mmcore import (
     MMZStage,
     Property,
 )
-from ophyd_mmcore._connector import MMConnector, clean_name
+from ophyd_mmcore._connector import Halt, MMConnector, clean_name
 
 
 @pytest.mark.parametrize(
@@ -163,7 +169,7 @@ async def test_rejected_state_keeps_previous_target(ctrl):
     async with init_devices():
         wheel = MMStateDevice("Wheel", ctrl)
     await wheel.set("B")
-    with pytest.raises(Exception):
+    with pytest.raises(RuntimeError, match="Label not defined"):
         await wheel.set("Z")
     assert await wheel.locate() == {"setpoint": "B", "readback": "B"}
 
@@ -202,3 +208,88 @@ async def test_system_moves_declared_devices(ctrl):
     assert (await scope.describe()).keys() == {"scope-z"}
     assert await scope.xy.x.position.get_value() == 1.0
     assert scope.xy.x.movable_logic.move_timeout == 5.0
+
+
+@pytest.mark.parametrize(
+    ("build", "signal", "change", "initial", "expected"),
+    [
+        (
+            lambda ctrl: MMZStage("Z", ctrl),
+            lambda d: d.position,
+            lambda core: core.setPosition("Z", 4.0),
+            0.0,
+            4.0,
+        ),
+        (
+            lambda ctrl: MMXYStage("XY", ctrl),
+            lambda d: d.x.position,
+            lambda core: core.setXYPosition("XY", 1.0, 2.0),
+            0.0,
+            1.0,
+        ),
+        (
+            lambda ctrl: MMXYStage("XY", ctrl),
+            lambda d: d.y.position,
+            lambda core: core.setXYPosition("XY", 1.0, 2.0),
+            0.0,
+            2.0,
+        ),
+        (
+            lambda ctrl: MMShutter("Shutter", ctrl),
+            lambda d: d.position,
+            lambda core: core.setShutterOpen("Shutter", True),
+            False,
+            True,
+        ),
+        (
+            lambda ctrl: MMStateDevice("Wheel", ctrl),
+            lambda d: d.position,
+            lambda core: core.setState("Wheel", 2),
+            "A",
+            "C",
+        ),
+        (
+            lambda ctrl: MMStateDevice("Wheel", ctrl),
+            lambda d: d.position,
+            lambda core: core.setStateLabel("Wheel", "D"),
+            "A",
+            "D",
+        ),
+        (
+            lambda ctrl: MMConfigGroup("Channel", ctrl),
+            lambda d: d.position,
+            lambda core: core.setConfig("Channel", "B"),
+            "A",
+            "B",
+        ),
+    ],
+    ids=["z", "x", "y", "shutter", "state", "state-label", "config-group"],
+)
+async def test_change_on_the_core_reaches_the_position_signal(
+    ctrl, uni_core, build, signal, change, initial, expected
+):
+    """Deliver a change made on the core to a subscriber of the position signal."""
+    async with init_devices():
+        device = build(ctrl)
+    with MonitorQueue(signal(device)) as queue:
+        await queue.assert_updates(initial)
+        change(uni_core)
+        await queue.assert_updates(expected)
+
+
+class GroupProperty(MMConfigGroup):
+    power: A[SignalRW[float], Property("Power")]
+
+
+class GroupHalt(MMConfigGroup):
+    halt: A[TriggerableCommand, Halt()]
+
+
+@pytest.mark.parametrize(
+    ("cls", "match"),
+    [(GroupProperty, "GroupProperty.power"), (GroupHalt, "GroupHalt.halt")],
+)
+def test_config_group_refuses_property_and_halt(bare_ctrl, cls, match):
+    """Refuse a Property or a Halt declared on a configuration group."""
+    with pytest.raises(TypeError, match=match):
+        cls("Channel", bare_ctrl)

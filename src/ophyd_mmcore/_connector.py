@@ -187,6 +187,10 @@ class MMConnector(DeviceConnector):
                 raise TypeError(
                     f"{where}: {type(marker).__name__} does not fit a {origin.__name__}"
                 )
+            if isinstance(marker, getattr(cls, "refused_markers", ())):
+                raise TypeError(
+                    f"{where}: {type(marker).__name__} does not fit a {cls.__name__}"
+                )
             if isinstance(marker, SIGNAL_MARKERS + COMMAND_MARKERS) and not self.label:
                 raise TypeError(
                     f"{where}: {type(marker).__name__} needs a device with a label"
