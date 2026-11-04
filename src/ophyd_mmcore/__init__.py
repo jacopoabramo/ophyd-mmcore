@@ -2,6 +2,7 @@
 
 from importlib.metadata import version
 
+from ._backend import CameraState
 from ._connector import Label, Property
 from ._controller import MMController
 from ._devices import (
@@ -17,6 +18,7 @@ from ._stage import MMAxis, MMXYStage, MMZStage
 __version__ = version("ophyd-mmcore")
 
 __all__ = [
+    "CameraState",
     "Label",
     "MMAxis",
     "MMConfigGroup",

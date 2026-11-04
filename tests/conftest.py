@@ -42,6 +42,8 @@ class FakeCamera(SimpleCameraDevice):
         return np.uint16
 
     def snap(self, buffer: np.ndarray) -> Mapping:
+        # A sequence calls snap in a loop, so the sleep sets the frame rate.
+        time.sleep(self._exposure / 1000)
         buffer[...] = self._frame
         self._frame += 1
         return {}
@@ -66,6 +68,26 @@ class FakeCamera(SimpleCameraDevice):
         if self._sequence_running:
             raise RuntimeError("busy")
         self._gain = value
+
+
+class RgbCamera(SimpleCameraDevice):
+    """Camera with a 16 x 24 sensor of 8-bit RGB pixels."""
+
+    def get_exposure(self) -> float:
+        return 10.0
+
+    def set_exposure(self, exposure: float) -> None:
+        pass
+
+    def sensor_shape(self) -> tuple[int, int, int]:
+        return (16, 24, 3)
+
+    def dtype(self) -> DTypeLike:
+        return np.uint8
+
+    def snap(self, buffer: np.ndarray) -> Mapping:
+        buffer[...] = 0
+        return {}
 
 
 class FakeStage(StageDevice):
@@ -183,6 +205,18 @@ def ctrl(uni_core: UniMMCore) -> Iterator[MMController]:
     controller = MMController(uni_core)
     yield controller
     controller.close()
+
+
+@pytest.fixture
+def ctrl_with_rgb() -> Iterator[MMController]:
+    """Return a controller on a core with the RGB camera `Rgb`."""
+    core = UniMMCore()
+    core.loadPyDevice("Rgb", RgbCamera())
+    core.initializeDevice("Rgb")
+    controller = MMController(core)
+    yield controller
+    controller.close()
+    core.unloadAllDevices()
 
 
 @pytest.fixture

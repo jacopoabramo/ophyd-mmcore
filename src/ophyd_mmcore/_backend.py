@@ -14,12 +14,22 @@ from ophyd_async.core import (
     SignalBackend,
     SignalDatatypeT,
     SignalMetadata,
+    StrictEnum,
     make_datakey,
 )
 
 T = TypeVar("T")
 
 logger = logging.getLogger(__name__)
+
+
+class CameraState(StrictEnum):
+    """What a camera is doing, or that writing a frame failed."""
+
+    IDLE = "idle"
+    ACQUIRING = "acquiring"
+    CAPTURING = "capturing"
+    FAULTED = "faulted"
 
 
 @dataclass(frozen=True)

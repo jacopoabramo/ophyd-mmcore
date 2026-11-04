@@ -1,15 +1,21 @@
 import asyncio
+import logging
 import threading
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, ParamSpec, TypeVar
 
+import numpy as np
 from event_model import Limits
 from ophyd_async.core import SignalMetadata
 from pymmcore_plus import CMMCorePlus, PropertyType
 
 from ._backend import MMSource
+from ._camera_io import SEQUENCE_LENGTH, CameraIO
+from ._frames import FrameRouter
+
+logger = logging.getLogger(__name__)
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -53,6 +59,11 @@ class MMController:
         self._closed = False
         self._targets: dict[tuple[str, str], Any] = {}
         self._xy_locks: dict[str, asyncio.Lock] = {}
+        self._cameras: dict[str, CameraIO] = {}
+        self._acquiring: str | None = None
+        self._restore: tuple[str, bool] | None = None
+        self._router = FrameRouter(core, self._deliver)
+        self._dropped: set[str] = set()
         events = core.events
         self._connections: list[tuple[Any, Callable[..., None]]] = [
             (events.propertyChanged, self._on_property),
@@ -130,10 +141,15 @@ class MMController:
             return result
 
         async def read() -> Any:
+            if (camera := self._cameras.get(label)) is not None:
+                return await camera.read_setting(prop, get)
             return await self.call(get)
 
         async def write(value: Any) -> None:
-            await self.call(set_, value)
+            if (camera := self._cameras.get(label)) is not None:
+                await camera.write_setting(prop, lambda: set_(value), get)
+            else:
+                await self.call(set_, value)
 
         async def infer() -> type:
             return await self.call(property_type)
@@ -346,8 +362,97 @@ class MMController:
 
         return run
 
+    def camera_io(self, label: str, physical: Sequence[str] = ()) -> CameraIO:
+        """Return the sequence flags and stores of the camera `label`.
+
+        The camera has one output per label in `physical`, or one output for
+        `label` itself when `physical` is empty. Reads and writes of the
+        camera's properties go through it from the first call on.
+
+        Raises
+        ------
+        ValueError
+            If an earlier call for `label` named other physical cameras.
+        """
+        outputs = tuple(physical) or (label,)
+        camera = self._cameras.setdefault(label, CameraIO(self, label, outputs))
+        if camera.physical != outputs:
+            raise ValueError(
+                f"Camera {label!r} has the outputs {camera.physical}, not {outputs}"
+            )
+        return camera
+
+    def _sequence_running(self) -> bool:
+        return self._acquiring is not None
+
+    async def _start_sequence(self, label: str, prepare: Callable[[], None]) -> None:
+        """Make `label` the current camera with AutoShutter off and start its sequence.
+
+        `prepare` runs once the camera is current, before the sequence starts.
+        """
+        if self._acquiring is not None:
+            raise RuntimeError(
+                f"Camera {self._acquiring!r} is already acquiring, and only one "
+                f"camera per core can run a sequence; stop it before {label!r}"
+            )
+        self._acquiring = label
+        try:
+            self._restore = await self.call(self._begin_sequence, label, prepare)
+        except Exception:
+            self._acquiring = None
+            raise
+        self._router.start()
+
+    def _begin_sequence(
+        self, label: str, prepare: Callable[[], None]
+    ) -> tuple[str, bool]:
+        restore = (self._core.getCameraDevice(), self._core.getAutoShutter())
+        self._core.setCameraDevice(label)
+        self._core.setAutoShutter(False)
+        try:
+            prepare()
+            self._core.startSequenceAcquisition(label, SEQUENCE_LENGTH, 0, False)
+        except Exception:
+            self._core.setCameraDevice(restore[0])
+            self._core.setAutoShutter(restore[1])
+            raise
+        return restore
+
+    async def _stop_sequence(self, label: str) -> None:
+        """Stop the sequence of `label` and restore the camera and AutoShutter."""
+        if self._acquiring == label:
+            await self.call(self._end_sequence)
+
+    def _end_sequence(self) -> None:
+        restore, self._restore = self._restore, None
+        try:
+            if self._acquiring is not None:
+                self._core.stopSequenceAcquisition(self._acquiring)
+        finally:
+            try:
+                self._router.stop()
+                if restore is not None:
+                    self._core.setCameraDevice(restore[0])
+                    self._core.setAutoShutter(restore[1])
+            finally:
+                self._acquiring = None
+
+    def _deliver(self, physical: str, frame: np.ndarray) -> None:
+        camera = self._cameras.get(self._acquiring or "")
+        delivered = camera is not None and camera.deliver(physical, frame)
+        if not delivered and physical not in self._dropped:
+            self._dropped.add(physical)
+            logger.warning("Dropping the frames of %r, which has no output", physical)
+
     def close(self) -> None:
-        """Disconnect every core event and drop every subscription."""
+        """Stop the acquiring camera, close every store and drop every subscription.
+
+        The camera and AutoShutter current before the sequence started are
+        restored. Closing again does nothing.
+        """
+        for camera in self._cameras.values():
+            camera.close()
+        self._end_sequence()
         with self._lock:
             self._closed = True
             subscriptions = [s for subs in self._subscriptions.values() for s in subs]
