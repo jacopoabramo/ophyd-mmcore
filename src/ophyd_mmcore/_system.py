@@ -140,6 +140,16 @@ class MMSystem(StandardReadable):
     TypeError
         `source` is neither a path nor a core, or `core` is given with a core
         as `source`.
+    FileNotFoundError
+        `source` is a path that names no file, here or in the adapter search
+        paths.
+    ValueError
+        Raised by `connect` when the core holds a label of the file with
+        another library or adapter, when two children would get the same key
+        or an empty one, or when a camera would be added to a root without a
+        path provider.
+    NotConnectedError
+        Raised by `connect` when a declared label is not loaded on the core.
     """
 
     def __init__(

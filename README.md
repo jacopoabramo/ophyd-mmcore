@@ -41,7 +41,7 @@ def plan():
 RunEngine()(plan())
 ```
 
-A child is keyed by its cleaned label, so the device labelled `Camera` is `scope.camera`. A configuration group gets its cleaned name followed by `_group`, such as `scope.channel_group`, so that it never shares a key with a device. Each camera writes into the directory that the path provider gives it, which must therefore be absolute. Replace `MMConfig_demo.cfg` with your own file: a relative path that is not in the working directory is looked up in Micro-Manager's adapter folders.
+A child is keyed by its cleaned label, so the device labelled `Camera` is `scope.camera`. A configuration group gets its cleaned name followed by `_group`, such as `scope.channel_group`, so that a group and a device of the same name get different keys. Each camera writes into the directory that the path provider gives it, which must therefore be absolute. Replace `MMConfig_demo.cfg` with your own file: a relative path that is not in the working directory is looked up in Micro-Manager's adapter folders.
 
 `MMSystem` also takes a core whose devices are already loaded, and then loads nothing. Given a file together with `core=`, it loads the file into that core but keeps any device the core already holds under the same label and adapter. A label that the core holds with another adapter makes `connect()` raise `ValueError` before any device is loaded.
 
