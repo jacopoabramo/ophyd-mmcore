@@ -1,5 +1,4 @@
 import asyncio
-import contextlib
 import inspect
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from dataclasses import dataclass
@@ -247,45 +246,56 @@ class MMCamera(StandardDetector):
             ),
         )
 
-    @contextlib.asynccontextmanager
-    async def _raise_on_fault(self) -> AsyncGenerator[None, None]:
-        """Stop the block as soon as the camera faults.
+    async def _raise_on_fault(
+        self, updates: AsyncGenerator[WatcherUpdate[int], None]
+    ) -> AsyncIterator[WatcherUpdate[int]]:
+        """Pass on `updates` until the camera faults.
 
         Raises
         ------
         RuntimeError
             With the camera's last error, if the camera faults.
         """
-        scope = asyncio.timeout(None)
-
-        async def expire_on_fault() -> None:
-            await wait_for_value(self.state, CameraState.FAULTED, timeout=None)
-            scope.reschedule(asyncio.get_running_loop().time())
-
+        fault = asyncio.ensure_future(
+            wait_for_value(self.state, CameraState.FAULTED, timeout=None)
+        )
         try:
-            async with scope:
-                watcher = asyncio.ensure_future(expire_on_fault())
+            while True:
+                step = asyncio.ensure_future(anext(updates))
                 try:
-                    yield
+                    await asyncio.wait(
+                        (step, fault), return_when=asyncio.FIRST_COMPLETED
+                    )
                 finally:
-                    watcher.cancel()
-        except TimeoutError:
-            if not scope.expired():
-                raise
-            raise RuntimeError(await self.last_error.get_value()) from None
+                    step.cancel()
+                    # A cancel can be ignored by code that finishes at the same
+                    # time, so the step must end before the generator is closed.
+                    await asyncio.wait((step,))
+                if fault.done():
+                    raise RuntimeError(await self.last_error.get_value())
+                try:
+                    update = step.result()
+                except StopAsyncIteration:
+                    return
+                yield update
+        finally:
+            fault.cancel()
+            await updates.aclose()
 
     # The base methods are unwrapped so that their own watcher updates pass
-    # through unchanged while the fault scope runs in the same task.
+    # through unchanged.
     @WatchableAsyncStatus.wrap
     async def trigger(self) -> AsyncIterator[WatcherUpdate[int]]:
         """Take one collection, failing with the camera's last error if it faults."""
-        async with self._raise_on_fault():
-            async for update in inspect.unwrap(StandardDetector.trigger)(self):
-                yield update
+        async for update in self._raise_on_fault(
+            inspect.unwrap(StandardDetector.trigger)(self)
+        ):
+            yield update
 
     @WatchableAsyncStatus.wrap
     async def complete(self) -> AsyncIterator[WatcherUpdate[int]]:
         """Wait for the kicked-off collections, failing with the camera's last error if it faults."""
-        async with self._raise_on_fault():
-            async for update in inspect.unwrap(StandardDetector.complete)(self):
-                yield update
+        async for update in self._raise_on_fault(
+            inspect.unwrap(StandardDetector.complete)(self)
+        ):
+            yield update
