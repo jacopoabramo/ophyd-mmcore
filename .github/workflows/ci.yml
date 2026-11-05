@@ -2,6 +2,8 @@ name: CI
 
 on:
   push:
+    branches: [main]
+    tags: ["v*"]
   pull_request:
 
 permissions:
@@ -34,6 +36,10 @@ jobs:
 
       - name: Install the Micro-Manager test adapters
         run: uv run mmcore install --test-adapters
+
+      - name: Check the demo adapters are installed
+        shell: bash
+        run: uv run python -c "from pymmcore_plus import CMMCorePlus; names = set(CMMCorePlus().getDeviceAdapterNames()); assert {'DemoCamera', 'Utilities'} <= names, names"
 
       - name: Run the tests
         run: uv run pytest -q
