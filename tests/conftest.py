@@ -228,38 +228,36 @@ def bare_ctrl() -> Iterator[MMController]:
     controller.close()
 
 
-DEMO_SKIP = (
-    "Micro-Manager demo adapters not installed; run mmcore install --test-adapters"
-)
-
-
 @pytest.fixture
-def demo_ctrl() -> Iterator[MMController]:
-    """Return a controller on the Micro-Manager demo configuration."""
-    try:
-        controller = MMController.from_config("MMConfig_demo.cfg")
-    except Exception:
-        pytest.skip(DEMO_SKIP)
-    yield controller
-    controller.close()
-    controller.core.unloadAllDevices()
-
-
-@pytest.fixture
-def multi_ctrl() -> Iterator[MMController]:
-    """Return a controller on a core with a Multi Camera over two demo cameras."""
+def demo_core() -> Iterator[CMMCorePlus]:
+    """Return a new core, unloaded after the test, or skip without the demo adapters."""
     core = CMMCorePlus()
-    try:
-        core.loadDevice("Cam1", "DemoCamera", "DCam")
-        core.loadDevice("Cam2", "DemoCamera", "DCam")
-        core.loadDevice("Multi", "Utilities", "Multi Camera")
-        core.initializeAllDevices()
-    except Exception:
-        pytest.skip(DEMO_SKIP)
-    core.setProperty("Multi", "Physical Camera 1", "Cam1")
-    core.setProperty("Multi", "Physical Camera 2", "Cam2")
-    core.setCameraDevice("Multi")
-    controller = MMController(core)
+    if not {"DemoCamera", "Utilities"} <= set(core.getDeviceAdapterNames()):
+        pytest.skip(
+            "Micro-Manager demo adapters not installed; run mmcore install --test-adapters"
+        )
+    yield core
+    core.unloadAllDevices()
+
+
+@pytest.fixture
+def demo_ctrl(demo_core: CMMCorePlus) -> Iterator[MMController]:
+    """Return a controller on the Micro-Manager demo configuration."""
+    controller = MMController.from_config("MMConfig_demo.cfg", demo_core)
     yield controller
     controller.close()
-    core.unloadAllDevices()
+
+
+@pytest.fixture
+def multi_ctrl(demo_core: CMMCorePlus) -> Iterator[MMController]:
+    """Return a controller on a core with a Multi Camera over two demo cameras."""
+    demo_core.loadDevice("Cam1", "DemoCamera", "DCam")
+    demo_core.loadDevice("Cam2", "DemoCamera", "DCam")
+    demo_core.loadDevice("Multi", "Utilities", "Multi Camera")
+    demo_core.initializeAllDevices()
+    demo_core.setProperty("Multi", "Physical Camera 1", "Cam1")
+    demo_core.setProperty("Multi", "Physical Camera 2", "Cam2")
+    demo_core.setCameraDevice("Multi")
+    controller = MMController(demo_core)
+    yield controller
+    controller.close()

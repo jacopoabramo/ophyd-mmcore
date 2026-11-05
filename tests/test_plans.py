@@ -3,6 +3,7 @@
 from collections import defaultdict
 from typing import cast
 from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 import bluesky.plan_stubs as bps
 import bluesky.plans as bp
@@ -45,7 +46,7 @@ def run(plan):
 
 def open_array(resource):
     """Return the array a stream resource points at."""
-    store = zarr.open(urlparse(resource["uri"]).path.lstrip("/"))
+    store = zarr.open(url2pathname(urlparse(resource["uri"]).path))
     return cast("zarr.Array", store[resource["parameters"]["dataset"]])
 
 
