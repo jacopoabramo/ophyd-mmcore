@@ -16,16 +16,17 @@ from ophyd_async.core import (
     set_mock_value,
     wait_for_value,
 )
+from pymmcore_plus import CMMCorePlus
 
-from ophyd_mmcore import CameraState, Label, MMCamera, MMController, MMSystem
+from ophyd_mmcore import CameraState, Label, MMCamera, MMSystem
 
 
-async def test_prepare_names_the_store(bare_ctrl, tmp_path):
+async def test_prepare_names_the_store(bare_core, tmp_path):
     """Set file_path and data_key from the path provider at prepare."""
     async with init_devices(mock=True):
         cam = MMCamera(
             "Cam",
-            bare_ctrl,
+            bare_core,
             path_provider=StaticPathProvider(UUIDFilenameProvider(), tmp_path),
         )
     await cam.stage()
@@ -35,12 +36,12 @@ async def test_prepare_names_the_store(bare_ctrl, tmp_path):
     assert await cam.outputs["cam"].data_key.get_value() == "cam"
 
 
-async def test_multi_camera_has_one_data_key_per_output(bare_ctrl, tmp_path):
+async def test_multi_camera_has_one_data_key_per_output(bare_core, tmp_path):
     """Describe one stream per physical camera of a Multi Camera."""
     async with init_devices(mock=True):
         multi = MMCamera(
             "Multi",
-            bare_ctrl,
+            bare_core,
             path_provider=StaticPathProvider(UUIDFilenameProvider(), tmp_path),
             physical=("Cam1", "Cam2"),
         )
@@ -51,7 +52,7 @@ async def test_multi_camera_has_one_data_key_per_output(bare_ctrl, tmp_path):
     assert len(paths) == 2
 
 
-def test_count_emits_stream_documents(ctrl, tmp_path):
+def test_count_emits_stream_documents(uni_core, tmp_path):
     """Run count with three points and emit one resource and three datums for a zarr store."""
     RE = RunEngine()
     docs = defaultdict(list)
@@ -59,7 +60,7 @@ def test_count_emits_stream_documents(ctrl, tmp_path):
     with init_devices():
         cam = MMCamera(
             "Cam",
-            ctrl,
+            uni_core,
             path_provider=StaticPathProvider(UUIDFilenameProvider(), tmp_path),
         )
     RE(bp.count([cam], num=3))
@@ -71,7 +72,7 @@ def test_count_emits_stream_documents(ctrl, tmp_path):
     )
 
 
-def test_count_preserving_detector_state(ctrl, tmp_path, monkeypatch):
+def test_count_preserving_detector_state(uni_core, tmp_path, monkeypatch):
     """Run count with two points when ophyd-async asks the camera for its trigger info."""
     monkeypatch.setenv("OPHYD_ASYNC_PRESERVE_DETECTOR_STATE", "YES")
     RE = RunEngine()
@@ -80,19 +81,19 @@ def test_count_preserving_detector_state(ctrl, tmp_path, monkeypatch):
     with init_devices():
         cam = MMCamera(
             "Cam",
-            ctrl,
+            uni_core,
             path_provider=StaticPathProvider(UUIDFilenameProvider(), tmp_path),
         )
     RE(bp.count([cam], num=2))
     assert len(docs["event"]) == 2
 
 
-async def test_unstage_mid_capture_closes_the_store(ctrl, uni_core, tmp_path):
+async def test_unstage_mid_capture_closes_the_store(uni_core, tmp_path):
     """Unstage a camera mid-capture, keep its frames and restore AutoShutter."""
     async with init_devices():
         cam = MMCamera(
             "Cam",
-            ctrl,
+            uni_core,
             path_provider=StaticPathProvider(UUIDFilenameProvider(), tmp_path),
         )
     output = cam.outputs["cam"]
@@ -107,12 +108,29 @@ async def test_unstage_mid_capture_closes_the_store(ctrl, uni_core, tmp_path):
     assert uni_core.getAutoShutter() is True
 
 
-async def faulting_camera(ctrl: MMController, tmp_path: Path) -> MMCamera:
+async def test_first_trigger_starts_the_sequence(uni_core, tmp_path):
+    """Start the camera's sequence at the first trigger, not at stage."""
+    async with init_devices():
+        cam = MMCamera(
+            "Cam",
+            uni_core,
+            path_provider=StaticPathProvider(UUIDFilenameProvider(), tmp_path),
+        )
+    await cam.stage()
+    assert not uni_core.isSequenceRunning()
+    await cam.prepare(TriggerInfo(number_of_events=1))
+    await cam.trigger()
+    assert uni_core.isSequenceRunning()
+    await cam.unstage()
+    assert not uni_core.isSequenceRunning()
+
+
+async def faulting_camera(core: CMMCorePlus, tmp_path: Path) -> MMCamera:
     """Return a mock camera that faults with "boom" when its capture starts."""
     async with init_devices(mock=True):
         cam = MMCamera(
             "Cam",
-            ctrl,
+            core,
             path_provider=StaticPathProvider(UUIDFilenameProvider(), tmp_path),
         )
 
@@ -127,17 +145,17 @@ async def faulting_camera(ctrl: MMController, tmp_path: Path) -> MMCamera:
     return cam
 
 
-async def test_trigger_raises_fault(bare_ctrl, tmp_path):
+async def test_trigger_raises_fault(bare_core, tmp_path):
     """Fail a trigger with the camera's last error as soon as the camera faults."""
-    cam = await faulting_camera(bare_ctrl, tmp_path)
+    cam = await faulting_camera(bare_core, tmp_path)
     async with asyncio.timeout(2):
         with pytest.raises(RuntimeError, match="boom"):
             await cam.trigger()
 
 
-async def test_complete_raises_fault(bare_ctrl, tmp_path):
+async def test_complete_raises_fault(bare_core, tmp_path):
     """Fail a fly scan's complete with the camera's last error as soon as the camera faults."""
-    cam = await faulting_camera(bare_ctrl, tmp_path)
+    cam = await faulting_camera(bare_core, tmp_path)
     await cam.prepare(TriggerInfo(number_of_events=2))
     await cam.kickoff()
     async with asyncio.timeout(2):
@@ -149,11 +167,11 @@ class Rig(MMSystem):
     cam: A[MMCamera, Label("Cam")]
 
 
-async def test_system_camera_uses_system_path_provider(bare_ctrl, tmp_path):
+async def test_system_camera_uses_system_path_provider(bare_core, tmp_path):
     """Name a declared camera's store with the system's path provider."""
     async with init_devices(mock=True):
         rig = Rig(
-            bare_ctrl,
+            bare_core,
             path_provider=StaticPathProvider(UUIDFilenameProvider(), tmp_path),
         )
     await rig.cam.stage()
@@ -164,7 +182,7 @@ async def test_system_camera_uses_system_path_provider(bare_ctrl, tmp_path):
     assert await rig.cam.outputs["cam"].data_key.get_value() == "rig-cam"
 
 
-def test_system_camera_needs_path_provider(bare_ctrl):
+def test_system_camera_needs_path_provider(bare_core):
     """Refuse a declared camera when its system has no path provider."""
     with pytest.raises(ValueError, match="Cam"):
-        Rig(bare_ctrl)
+        Rig(bare_core)

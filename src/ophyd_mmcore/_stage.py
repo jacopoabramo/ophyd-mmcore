@@ -1,14 +1,16 @@
 from collections.abc import Sequence
 from functools import cached_property
+from typing import TYPE_CHECKING, Literal
 from typing import Annotated as A
-from typing import Literal
 
 from ophyd_async.core import SignalRW, TriggerableCommand
 from ophyd_async.core import StandardReadableFormat as Format
 
 from ._connector import Halt, MMConnector, Position, XYAxis
-from ._controller import MMController
 from ._devices import MMDevice, MMMovable, MMMoveLogic, movable_connector
+
+if TYPE_CHECKING:
+    from pymmcore_plus import CMMCorePlus
 
 
 class MMAxis(MMMovable[float], MMDevice):
@@ -27,7 +29,7 @@ class MMAxis(MMMovable[float], MMDevice):
     def __init__(
         self,
         label: str = "",
-        ctrl: MMController | None = None,
+        core: "CMMCorePlus | None" = None,
         *,
         axis: Literal["x", "y"] | None = None,
         properties: Sequence[str] = (),
@@ -35,11 +37,11 @@ class MMAxis(MMMovable[float], MMDevice):
         name: str = "",
         connector: MMConnector | None = None,
     ) -> None:
-        label, ctrl, properties, connector = movable_connector(
-            label, ctrl, axis, properties, move_timeout, connector
+        label, core, properties, connector = movable_connector(
+            label, core, axis, properties, move_timeout, connector
         )
         super().__init__(
-            label, ctrl, properties=properties, name=name, connector=connector
+            label, core, properties=properties, name=name, connector=connector
         )
 
     @cached_property
@@ -59,7 +61,7 @@ class MMZStage(MMAxis):
     def __init__(
         self,
         label: str = "",
-        ctrl: MMController | None = None,
+        core: "CMMCorePlus | None" = None,
         *,
         properties: Sequence[str] = (),
         move_timeout: float | None = 10.0,
@@ -68,7 +70,7 @@ class MMZStage(MMAxis):
     ) -> None:
         super().__init__(
             label,
-            ctrl,
+            core,
             properties=properties,
             move_timeout=move_timeout,
             name=name,
@@ -89,16 +91,16 @@ class MMXYStage(MMDevice):
     def __init__(
         self,
         label: str = "",
-        ctrl: MMController | None = None,
+        core: "CMMCorePlus | None" = None,
         *,
         properties: Sequence[str] = (),
         move_timeout: float | None = 10.0,
         name: str = "",
         connector: MMConnector | None = None,
     ) -> None:
-        label, ctrl, properties, connector = movable_connector(
-            label, ctrl, None, properties, move_timeout, connector
+        label, core, properties, connector = movable_connector(
+            label, core, None, properties, move_timeout, connector
         )
         super().__init__(
-            label, ctrl, properties=properties, name=name, connector=connector
+            label, core, properties=properties, name=name, connector=connector
         )

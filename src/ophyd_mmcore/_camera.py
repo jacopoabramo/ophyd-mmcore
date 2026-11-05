@@ -3,6 +3,7 @@ import inspect
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 from typing import Annotated as A
 
 from ophyd_async.core import (
@@ -27,8 +28,10 @@ from ophyd_async.core import (
 
 from ._backend import CameraState
 from ._connector import CameraValue, MMConnector, OutputValue, clean_name
-from ._controller import MMController
 from ._devices import property_map
+
+if TYPE_CHECKING:
+    from pymmcore_plus import CMMCorePlus
 
 
 class MMCameraOutput(Device):
@@ -80,7 +83,10 @@ class MMTriggerLogic(DetectorTriggerLogic):
 
 @dataclass
 class MMAcquireLogic(DetectorAcquireLogic):
-    """Run the camera's sequence from stage to unstage and open the gate to the stores."""
+    """Run the camera's sequence from its first acquisition to unstage.
+
+    Each acquisition opens the gate to the stores.
+    """
 
     acquire: SignalRW[bool]
     capture: SignalRW[bool]
@@ -89,11 +95,11 @@ class MMAcquireLogic(DetectorAcquireLogic):
     last_error: SignalR[str]
 
     async def ensure_ready(self) -> None:
-        """Start the camera's sequence."""
-        await self.acquire.set(True)
+        """Do nothing: the sequence starts at the first acquisition, not at staging."""
 
     async def start_acquiring(self) -> None:
-        """Open the gate to the stores."""
+        """Start the camera's sequence, then open the gate to the stores."""
+        await self.acquire.set(True)
         await self.capture.set(True)
 
     async def wait_for_idle(self) -> None:
@@ -161,7 +167,7 @@ class MMDataLogic(DetectorDataLogic):
 class MMCamera(StandardDetector):
     """A Micro-Manager camera that writes its frames to zarr stores.
 
-    Pass either `label` with `ctrl`, or a `connector`, as a declared child
+    Pass either `label` with `core`, or a `connector`, as a declared child
     receives. The camera has one output per label in `physical`, as a
     `Multi Camera` has, or one output named after its own label when
     `physical` is empty. The path provider names each output's store at
@@ -171,7 +177,7 @@ class MMCamera(StandardDetector):
     Raises
     ------
     ValueError
-        If both or neither of `ctrl` and `connector` are given, if options are
+        If both or neither of `core` and `connector` are given, if options are
         given with a `connector`, or if there is no path provider.
     """
 
@@ -185,7 +191,7 @@ class MMCamera(StandardDetector):
     def __init__(
         self,
         label: str = "",
-        ctrl: MMController | None = None,
+        core: "CMMCorePlus | None" = None,
         *,
         path_provider: PathProvider | None = None,
         physical: Sequence[str] = (),
@@ -196,20 +202,20 @@ class MMCamera(StandardDetector):
         if connector is not None:
             if (
                 label
-                or ctrl is not None
+                or core is not None
                 or path_provider is not None
                 or physical
                 or properties
             ):
                 raise ValueError(
-                    "MMCamera takes either a connector or a label, ctrl and "
+                    "MMCamera takes either a connector or a label, core and "
                     "options, not both"
                 )
-        elif ctrl is None:
-            raise ValueError("MMCamera needs either a ctrl or a connector")
+        elif core is None:
+            raise ValueError("MMCamera needs either a core or a connector")
         else:
             connector = MMConnector(
-                ctrl,
+                core,
                 label,
                 physical=physical,
                 properties=properties,
