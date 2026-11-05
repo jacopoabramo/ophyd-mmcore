@@ -75,8 +75,8 @@ class MMTriggerLogic(DetectorTriggerLogic):
         await self.num_capture.set(num)
 
     async def default_trigger_info(self) -> TriggerInfo:
-        """Return a trigger info with no limit on the number of events."""
-        return TriggerInfo(number_of_events=0)
+        """Return the trigger info of one event, which a step scan triggers."""
+        return TriggerInfo()
 
 
 @dataclass

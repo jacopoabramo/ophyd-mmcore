@@ -71,6 +71,22 @@ def test_count_emits_stream_documents(ctrl, tmp_path):
     )
 
 
+def test_count_preserving_detector_state(ctrl, tmp_path, monkeypatch):
+    """Run count with two points when ophyd-async asks the camera for its trigger info."""
+    monkeypatch.setenv("OPHYD_ASYNC_PRESERVE_DETECTOR_STATE", "YES")
+    RE = RunEngine()
+    docs = defaultdict(list)
+    RE.subscribe(lambda n, d: docs[n].append(d))
+    with init_devices():
+        cam = MMCamera(
+            "Cam",
+            ctrl,
+            path_provider=StaticPathProvider(UUIDFilenameProvider(), tmp_path),
+        )
+    RE(bp.count([cam], num=2))
+    assert len(docs["event"]) == 2
+
+
 async def test_unstage_mid_capture_closes_the_store(ctrl, uni_core, tmp_path):
     """Unstage a camera mid-capture, keep its frames and restore AutoShutter."""
     async with init_devices():
