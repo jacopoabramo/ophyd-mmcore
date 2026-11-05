@@ -1,6 +1,7 @@
 import contextlib
 import logging
 import os
+from collections.abc import Container
 from pathlib import Path
 
 from ophyd_async.core import Device, PathProvider
@@ -160,13 +161,14 @@ def physical_cameras(core: CMMCorePlus, label: str) -> list[str]:
     return [value for value in values if value != "Undefined"]
 
 
-def make_devices(
+def build_devices(
     core: CMMCorePlus,
     *,
-    path_provider: PathProvider,
-    move_timeout: float | None = 10.0,
+    path_provider: PathProvider | None,
+    move_timeout: float | None,
+    skip: Container[str],
 ) -> dict[str, Device]:
-    """Build an ophyd-async device for each device the core has loaded.
+    """Build an ophyd-async device for each device the core has loaded, except those in `skip`.
 
     The class follows the Micro-Manager device type: `MMCamera`, `MMZStage`,
     `MMXYStage`, `MMShutter`, `MMStateDevice` or `MMDevice`. Other types, such
@@ -183,11 +185,14 @@ def make_devices(
     Raises
     ------
     ValueError
-        Two labels clean to the same key.
+        Two labels clean to the same key, or there is a camera and no
+        `path_provider`.
     """
     devices: dict[str, Device] = {}
     labels: dict[str, str] = {}
     for label in core.getLoadedDevices():
+        if label in skip:
+            continue
         key = clean_name(label)
         match core.getDeviceType(label):
             case DeviceType.Camera:
@@ -225,14 +230,14 @@ def make_devices(
     return devices
 
 
-def make_config_groups(
-    core: CMMCorePlus, *, move_timeout: float | None = 10.0
+def build_groups(
+    core: CMMCorePlus, *, move_timeout: float | None, skip: Container[str]
 ) -> dict[str, MMConfigGroup]:
-    """Build an `MMConfigGroup` for each configuration group of the core.
+    """Build an `MMConfigGroup` for each configuration group of the core, except those in `skip`.
 
-    Each key is the cleaned group name and each group is named `<key>_group`,
-    so its data keys differ from those of a device with the same name. Nothing
-    is connected.
+    Each key is the cleaned group name followed by `_group`, and each group is
+    named by its key, so its data keys differ from those of a device with the
+    same name. Nothing is connected.
 
     Raises
     ------
@@ -242,13 +247,13 @@ def make_config_groups(
     groups: dict[str, MMConfigGroup] = {}
     names: dict[str, str] = {}
     for group in core.getAvailableConfigGroups():
-        key = clean_name(group)
+        if group in skip:
+            continue
+        key = f"{clean_name(group)}_group"
         if key in groups:
             raise ValueError(
                 f"Group names {names[key]!r} and {group!r} both clean to {key!r}"
             )
-        groups[key] = MMConfigGroup(
-            group, core, move_timeout=move_timeout, name=f"{key}_group"
-        )
+        groups[key] = MMConfigGroup(group, core, move_timeout=move_timeout, name=key)
         names[key] = group
     return groups

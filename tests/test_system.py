@@ -1,10 +1,25 @@
 import logging
+from collections import defaultdict
+from typing import Annotated as A
+from typing import cast
 
+import bluesky.plans as bp
 import pytest
-from conftest import provider
+from bluesky import RunEngine
+from conftest import FakeStage, provider
+from ophyd_async.plan_stubs import ensure_connected
 from pymmcore_plus import CMMCorePlus
 
-from ophyd_mmcore import MMSystem
+from ophyd_mmcore import (
+    Label,
+    MMCamera,
+    MMConfigGroup,
+    MMShutter,
+    MMStateDevice,
+    MMSystem,
+    MMXYStage,
+    MMZStage,
+)
 
 
 @pytest.mark.demo
@@ -107,3 +122,96 @@ def test_core_keyword_with_a_core_is_refused(bare_core):
     """Refuse core= when the source is already a core."""
     with pytest.raises(TypeError):
         MMSystem(bare_core, core=bare_core)
+
+
+async def test_root_on_core_discovers_devices_and_groups(uni_core, tmp_path):
+    """Add one child per loaded device and per group, chosen by type."""
+    scope = MMSystem(uni_core, path_provider=provider(tmp_path), name="scope")
+    await scope.connect()
+    assert {key: type(child) for key, child in scope.children()} == {
+        "cam": MMCamera,
+        "cam2": MMCamera,
+        "z": MMZStage,
+        "xy": MMXYStage,
+        "shutter": MMShutter,
+        "wheel": MMStateDevice,
+        "channel_group": MMConfigGroup,
+    }
+    assert dict(scope.children())["xy"].name == "scope-xy"
+
+
+async def test_declared_child_is_not_discovered_twice(uni_core, tmp_path):
+    """Skip a label a declared child binds under another attribute name."""
+
+    class Scope(MMSystem):
+        camera: A[MMCamera, Label("Cam")]
+
+    scope = Scope(uni_core, path_provider=provider(tmp_path))
+    await scope.connect()
+    assert not hasattr(scope, "cam")
+
+
+async def test_declared_attribute_with_other_label_clashes(uni_core, tmp_path):
+    """Refuse a discovered key that a declared child holds for another label."""
+
+    class Scope(MMSystem):
+        cam: A[MMZStage, Label("Z")]
+
+    with pytest.raises(ValueError, match="Cam"):
+        await Scope(uni_core, path_provider=provider(tmp_path)).connect()
+
+
+async def test_device_and_group_keys_clash(uni_core, tmp_path):
+    """Refuse a device whose key equals a group's key."""
+    uni_core.loadPyDevice("Channel_group", FakeStage())
+    uni_core.initializeDevice("Channel_group")
+    with pytest.raises(ValueError, match="Channel_group"):
+        await MMSystem(uni_core, path_provider=provider(tmp_path)).connect()
+
+
+@pytest.mark.parametrize("label", ["Name", "Parent", "Connect"])
+async def test_label_naming_a_root_attribute_is_refused(uni_core, tmp_path, label):
+    """Refuse a device whose key is an attribute the root already has."""
+    uni_core.loadPyDevice(label, FakeStage())
+    uni_core.initializeDevice(label)
+    with pytest.raises(ValueError, match=label):
+        await MMSystem(uni_core, path_provider=provider(tmp_path)).connect()
+
+
+async def test_camera_without_path_provider_is_refused(uni_core):
+    """Refuse to discover a camera when the root has no path provider."""
+    with pytest.raises(ValueError, match="Cam"):
+        await MMSystem(uni_core).connect()
+
+
+async def test_colliding_labels_raise(bare_core, tmp_path):
+    """Refuse two device labels that clean to the same key."""
+    for label in ("Cam-1", "Cam 1"):
+        bare_core.loadPyDevice(label, FakeStage())
+        bare_core.initializeDevice(label)
+    with pytest.raises(ValueError, match="Cam-1"):
+        await MMSystem(bare_core, path_provider=provider(tmp_path)).connect()
+
+
+async def test_reconnect_keeps_discovered_children(uni_core, tmp_path):
+    """Connect again without adding or refusing the children found the first time."""
+    scope = MMSystem(uni_core, path_provider=provider(tmp_path), name="scope")
+    await scope.connect()
+    xy = dict(scope.children())["xy"]
+    await scope.connect(force_reconnect=True)
+    assert dict(scope.children())["xy"] is xy
+
+
+def test_count_of_one_camera_with_two_cameras_in_the_root(uni_core, tmp_path):
+    """Stage a root with two cameras and write the events of one of them."""
+    scope = MMSystem(uni_core, path_provider=provider(tmp_path))
+    RE = RunEngine()
+    docs = defaultdict(list)
+    RE.subscribe(lambda name, doc: docs[name].append(doc))
+
+    def plan():
+        yield from ensure_connected(scope)
+        yield from bp.count([cast("MMCamera", dict(scope.children())["cam2"])], 2)
+
+    RE(plan())
+    assert len(docs["event"]) == 2

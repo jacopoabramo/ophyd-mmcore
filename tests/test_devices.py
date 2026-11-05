@@ -2,6 +2,7 @@ import asyncio
 from typing import Annotated as A
 
 import pytest
+from conftest import provider
 from ophyd_async.core import (
     Command,
     NotConnectedError,
@@ -69,10 +70,10 @@ class Bench(MMSystem):
     wheel: A[Wheel, Label("Wheel", properties=("State",)), Format.CHILD]
 
 
-async def test_system_builds_labelled_children(uni_core):
+async def test_system_builds_labelled_children(uni_core, tmp_path):
     """Build a declared child from its Label and name it after the system."""
     async with init_devices():
-        bench = Bench(uni_core)
+        bench = Bench(uni_core, path_provider=provider(tmp_path))
     await assert_reading(bench, {"bench-wheel-label_": partial_reading("A")})
     assert "bench-wheel-properties-state" in await bench.wheel.read_configuration()
 
@@ -213,10 +214,10 @@ class Scope(MMSystem):
     channel: A[MMConfigGroup, Label("Channel")]
 
 
-async def test_system_moves_declared_devices(uni_core):
+async def test_system_moves_declared_devices(uni_core, tmp_path):
     """Move every kind of declared child of a system with the system's move timeout."""
     async with init_devices():
-        scope = Scope(uni_core, move_timeout=5.0)
+        scope = Scope(uni_core, path_provider=provider(tmp_path), move_timeout=5.0)
     await asyncio.gather(
         scope.z.set(4.0),
         scope.xy.x.set(1.0),

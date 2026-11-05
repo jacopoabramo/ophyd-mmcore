@@ -18,13 +18,15 @@ from ophyd_async.core import (
 )
 from ophyd_async.plan_stubs import ensure_connected
 
-from ophyd_mmcore import MMCamera, make_config_groups, make_devices
+from ophyd_mmcore import MMCamera, MMSystem
 
 pytestmark = pytest.mark.demo
 
 
-def fly(det, info):
-    """Return a plan that connects `det`, flies `info` and collects its frames."""
+def fly(scope, key, info):
+    """Return a plan that connects `scope`, flies `info` on its child `key` and collects its frames."""
+    yield from ensure_connected(scope)
+    det = getattr(scope, key)
 
     @bpp.stage_decorator([det])
     @bpp.run_decorator()
@@ -35,7 +37,6 @@ def fly(det, info):
         yield from bps.declare_stream(det, name="primary")
         yield from bps.collect(det, name="primary")
 
-    yield from ensure_connected(det)
     yield from inner()
 
 
@@ -54,30 +55,50 @@ def open_array(resource):
     return cast("zarr.Array", store[resource["parameters"]["dataset"]])
 
 
-def build(core, tmp_path):
-    """Return the devices of `core` writing into `tmp_path`."""
-    return make_devices(
+def system(core, tmp_path):
+    """Return a root over `core` whose cameras write into `tmp_path`."""
+    return MMSystem(
         core, path_provider=StaticPathProvider(UUIDFilenameProvider(), tmp_path)
     )
 
 
 def test_demo_builds_expected_devices(demo_loaded_core, tmp_path):
-    """Build the demo's camera, stages, shutter and groups from its cfg."""
-    devices = build(demo_loaded_core, tmp_path)
-    assert {"camera", "z", "xy", "white_light_shutter"} <= devices.keys()
-    assert {"camera", "channel", "objective"} <= make_config_groups(
-        demo_loaded_core
-    ).keys()
+    """Discover the demo's camera, stages, shutter and groups from its cfg."""
+    scope = system(demo_loaded_core, tmp_path)
+    run(ensure_connected(scope))
+    assert {
+        "camera",
+        "z",
+        "xy",
+        "white_light_shutter",
+        "camera_group",
+        "channel_group",
+        "objective_group",
+    } <= {key for key, _ in scope.children()}
+
+
+def test_count_from_a_configuration_file(demo_core, tmp_path):
+    """Count a camera of a root built from the demo configuration file."""
+    scope = MMSystem(
+        "MMConfig_demo.cfg",
+        core=demo_core,
+        path_provider=StaticPathProvider(UUIDFilenameProvider(), tmp_path),
+    )
+
+    def plan():
+        yield from ensure_connected(scope)
+        yield from bp.count([getattr(scope, "camera")], 2)
+
+    assert len(run(plan())["event"]) == 2
 
 
 def test_step_scan_writes_one_store(demo_loaded_core, tmp_path):
     """Write one frame per point of a Z scan into one zarr store."""
-    devices = build(demo_loaded_core, tmp_path)
-    cam, z = cast("MMCamera", devices["camera"]), devices["z"]
+    scope = system(demo_loaded_core, tmp_path)
 
     def plan():
-        yield from ensure_connected(cam, z)
-        yield from bp.scan([cam], z, 0, 10, 5)
+        yield from ensure_connected(scope)
+        yield from bp.scan([getattr(scope, "camera")], getattr(scope, "z"), 0, 10, 5)
 
     docs = run(plan())
     assert len(docs["stream_resource"]) == 1
@@ -86,9 +107,8 @@ def test_step_scan_writes_one_store(demo_loaded_core, tmp_path):
 
 def test_fly_scan_with_two_points_per_event(demo_loaded_core, tmp_path):
     """Write a fly scan's frames and describe them with the right shape."""
-    cam = build(demo_loaded_core, tmp_path)["camera"]
     info = TriggerInfo(number_of_events=10, collections_per_event=2)
-    docs = run(fly(cam, info))
+    docs = run(fly(system(demo_loaded_core, tmp_path), "camera", info))
     array = open_array(docs["stream_resource"][0])
     height, width = array.shape[1:]
     assert array.shape[0] == 20
@@ -100,28 +120,30 @@ def test_fly_scan_with_two_points_per_event(demo_loaded_core, tmp_path):
     )
 
 
-def test_channel_group_moves(demo_loaded_core):
+def test_channel_group_moves(demo_loaded_core, tmp_path):
     """Apply a Channel preset from a plan."""
-    group = make_config_groups(demo_loaded_core)["channel"]
+    scope = system(demo_loaded_core, tmp_path)
 
     def plan():
-        yield from ensure_connected(group)
-        yield from bps.mv(group, "DAPI")
+        yield from ensure_connected(scope)
+        yield from bps.mv(getattr(scope, "channel_group"), "DAPI")
 
     run(plan())
     assert demo_loaded_core.getCurrentConfig("Channel") == "DAPI"
 
 
-def test_make_devices_reads_multi_camera(multi_core, tmp_path):
-    """Give a Multi Camera one output per physical camera."""
-    devices = build(multi_core, tmp_path)
-    assert set(cast("MMCamera", devices["multi"]).outputs) == {"cam1", "cam2"}
+def test_multi_camera_has_one_output_per_physical_camera(multi_core, tmp_path):
+    """Give a discovered Multi Camera one output per physical camera."""
+    scope = system(multi_core, tmp_path)
+    run(ensure_connected(scope))
+    assert set(cast("MMCamera", getattr(scope, "multi")).outputs) == {"cam1", "cam2"}
 
 
 def test_multi_camera_fly_scan_writes_two_stores(multi_core, tmp_path):
     """Write one store per physical camera from one Multi Camera sequence."""
-    multi = build(multi_core, tmp_path)["multi"]
-    docs = run(fly(multi, TriggerInfo(number_of_events=6)))
+    docs = run(
+        fly(system(multi_core, tmp_path), "multi", TriggerInfo(number_of_events=6))
+    )
     resources = docs["stream_resource"]
     assert len({r["uri"] for r in resources}) == 2
     assert {r["parameters"]["dataset"] for r in resources} == {
