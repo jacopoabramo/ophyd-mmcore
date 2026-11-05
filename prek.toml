@@ -1,0 +1,24 @@
+[[repos]]
+repo = "local"
+
+[[repos.hooks]]
+id = "ruff-check"
+name = "ruff check"
+entry = "uv run ruff check"
+language = "system"
+types = ["python"]
+
+[[repos.hooks]]
+id = "ruff-format"
+name = "ruff format --check"
+entry = "uv run ruff format --check"
+language = "system"
+types = ["python"]
+
+[[repos.hooks]]
+id = "pyright"
+name = "pyright"
+entry = "uv run pyright"
+language = "system"
+types = ["python"]
+pass_filenames = false

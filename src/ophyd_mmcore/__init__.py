@@ -1,75 +1,41 @@
-"""ophyd-async devices backed by Micro-Manager via pymmcore-plus."""
-
-from __future__ import annotations
+"""ophyd-async devices for Micro-Manager hardware driven through pymmcore-plus."""
 
 from importlib.metadata import version
 
-from ._base import MMDevice, get_worker
-from ._camera import (
-    MMArmLogic,
-    MMCamera,
-    MMTriggerLogic,
-    MMZarrDataLogic,
-    MMZarrStreamProvider,
-    ZarrStore,
-)
-from ._connector import (
-    CoreMethod,
-    ExposureMethod,
-    PropName,
-    ShutterOpenMethod,
-    XPositionMethod,
-    YPositionMethod,
-    ZPositionMethod,
-)
+from ._backend import CameraState
+from ._camera import MMCamera, MMCameraOutput
+from ._config import make_config_groups, make_devices
+from ._connector import Label, Property
+from ._controller import MMController
 from ._devices import (
-    MMAutoFocus,
-    MMGalvo,
-    MMPump,
+    MMConfigGroup,
+    MMDevice,
+    MMMoveLogic,
     MMShutter,
     MMStateDevice,
-    MMXYStage,
-    MMZStage,
+    MMSystem,
 )
-from ._signal import (
-    mmcore_signal_auto,
-    mmcore_signal_r,
-    mmcore_signal_rw,
-    mmcore_signal_w,
-)
-from ._worker import MMCoreWorker
+from ._stage import MMAxis, MMXYStage, MMZStage
 
-try:
-    __version__ = version("ophyd-mmcore")
-except Exception:
-    __version__ = "unknown"
+__version__ = version("ophyd-mmcore")
 
 __all__ = [
-    "MMCoreWorker",
-    "get_worker",
-    "CoreMethod",
-    "ExposureMethod",
-    "ZPositionMethod",
-    "XPositionMethod",
-    "YPositionMethod",
-    "ShutterOpenMethod",
-    "PropName",
-    "MMDevice",
+    "CameraState",
+    "Label",
+    "MMAxis",
     "MMCamera",
-    "MMTriggerLogic",
-    "MMArmLogic",
-    "MMZarrDataLogic",
-    "ZarrStore",
-    "MMZarrStreamProvider",
+    "MMCameraOutput",
+    "MMConfigGroup",
+    "MMController",
+    "MMDevice",
+    "MMMoveLogic",
     "MMShutter",
     "MMStateDevice",
-    "MMAutoFocus",
-    "MMGalvo",
-    "MMPump",
-    "MMZStage",
+    "MMSystem",
     "MMXYStage",
-    "mmcore_signal_rw",
-    "mmcore_signal_r",
-    "mmcore_signal_w",
-    "mmcore_signal_auto",
+    "MMZStage",
+    "Property",
+    "__version__",
+    "make_config_groups",
+    "make_devices",
 ]

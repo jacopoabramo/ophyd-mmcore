@@ -1,357 +1,295 @@
-"""Tests for all non-stage MMDevice mixins.
-
-Each mixin gets a fixture with a patched CMMCorePlus and tests covering:
-  - locate() returns current state
-  - set() calls the correct core method
-  - stop() halts an in-progress operation
-  - trigger() (where applicable)
-"""
-
-from __future__ import annotations
-
 import asyncio
-import contextlib
-from collections.abc import Generator
-from typing import Any
-from unittest.mock import patch
+from typing import Annotated as A
 
 import pytest
-from ophyd_async.core import WatcherUpdate
-from pymmcore_plus import CMMCorePlus
+from ophyd_async.core import (
+    Command,
+    SignalR,
+    SignalRW,
+    TriggerableCommand,
+    init_devices,
+)
+from ophyd_async.core import StandardReadableFormat as Format
+from ophyd_async.testing import MonitorQueue, assert_reading, partial_reading
 
-
-from ophyd_mmcore._devices import (
-    MMAutoFocus,
-    MMGalvo,
-    MMPump,
+from ophyd_mmcore import (
+    Label,
+    MMConfigGroup,
+    MMDevice,
     MMShutter,
     MMStateDevice,
+    MMSystem,
+    MMXYStage,
+    MMZStage,
+    Property,
 )
+from ophyd_mmcore._connector import Halt, MMConnector, clean_name
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("raw", "clean"),
+    [
+        ("CCDTemperature RO", "ccd_temperature_ro"),
+        ("PixelType", "pixel_type"),
+        ("Camera-1", "camera_1"),
+        ("XY", "xy"),
+        ("Exposure", "exposure"),
+    ],
+)
+def test_clean_name(raw, clean):
+    """Turn Micro-Manager names into lower-case identifiers."""
+    assert clean_name(raw) == clean
 
 
-def _base_patches(instance: CMMCorePlus):
-    """Return an ExitStack with all property-level MM patches applied."""
-    stack = contextlib.ExitStack()
-    stack.enter_context(patch.object(instance, "getPropertyType"))
-    stack.enter_context(patch.object(instance, "getProperty", return_value=""))
-    stack.enter_context(patch.object(instance, "setProperty"))
-    stack.enter_context(patch.object(instance, "isPropertyReadOnly", return_value=False))
-    stack.enter_context(patch.object(instance, "hasPropertyLimits", return_value=False))
-    stack.enter_context(patch.object(instance, "getAllowedPropertyValues", return_value=()))
-    stack.enter_context(patch.object(instance, "deviceBusy", return_value=False))
-    return stack
+class Wheel(MMDevice):
+    label_: A[SignalRW[str], Property("Label"), Format.HINTED_SIGNAL]
 
 
-def _watcher_collector() -> tuple[list[WatcherUpdate[Any]], Any]:
-    """Return (updates list, watch callable) for status.watch()."""
-    updates: list[WatcherUpdate[Any]] = []
+async def test_annotated_property_is_read(ctrl):
+    """Read an annotated property as a hinted signal."""
+    async with init_devices():
+        wheel = Wheel("Wheel", ctrl)
+    await assert_reading(wheel, {"wheel-label_": partial_reading("A")})
 
-    def _collect(**kwargs: Any) -> None:
-        updates.append(WatcherUpdate(**kwargs))  # type: ignore[arg-type]
 
-    return updates, _collect
+async def test_allow_list_goes_to_configuration(ctrl):
+    """Report allow-listed properties in read_configuration only."""
+    async with init_devices():
+        cam = MMDevice("Cam", ctrl, properties=["Gain"])
+    assert "cam-properties-gain" in await cam.read_configuration()
+    assert await cam.read() == {}
 
 
-# ---------------------------------------------------------------------------
-# Shutter
-# ---------------------------------------------------------------------------
+def test_colliding_property_names_raise(bare_ctrl):
+    """Refuse two properties that clean to the same key."""
+    with pytest.raises(ValueError, match="Pixel Type"):
+        MMDevice("Cam", bare_ctrl, properties=["PixelType", "Pixel Type"])
 
 
-MyShutter = MMShutter
+class Bench(MMSystem):
+    wheel: A[Wheel, Label("Wheel", properties=("State",)), Format.CHILD]
 
 
-@pytest.fixture
-def core_shutter() -> Generator[CMMCorePlus, None, None]:
-    instance = CMMCorePlus()
-    _state = {"open": False}
+async def test_system_builds_labelled_children(ctrl):
+    """Build a declared child from its Label and name it after the system."""
+    async with init_devices():
+        bench = Bench(ctrl)
+    await assert_reading(bench, {"bench-wheel-label_": partial_reading("A")})
+    assert "bench-wheel-properties-state" in await bench.wheel.read_configuration()
 
-    with _base_patches(instance) as stack:
-        for cm in [patch.object(instance, "getShutterOpen", side_effect=lambda lbl: _state["open"]),
-        patch.object(instance, "setShutterOpen", side_effect=lambda lbl, v: _state.update({"open": v})),
-        patch.object(instance, "stop")]:
-            stack.enter_context(cm)
-        yield instance
 
+class Unmarked(MMDevice):
+    power: SignalRW[float]
 
-async def test_shutter_locate(core_shutter: CMMCorePlus) -> None:
-    s = MyShutter("Shutter", core_shutter, name="shutter")
-    await s.connect(mock=False)
-    loc = await s.locate()
-    assert loc["readback"] is False
 
+class Doubled(MMDevice):
+    power: A[SignalRW[float], Property("Power"), Property("Level")]
 
-async def test_shutter_set_opens(core_shutter: CMMCorePlus) -> None:
-    s = MyShutter("Shutter", core_shutter, name="shutter")
-    await s.connect(mock=False)
-    await s.set(True)
-    core_shutter.setShutterOpen.assert_called_with("Shutter", True)  # type: ignore[attr-defined]
 
+class LabelOnSignal(MMDevice):
+    power: A[SignalR[float], Label("Laser")]
 
-async def test_shutter_locate_reflects_set(core_shutter: CMMCorePlus) -> None:
-    s = MyShutter("Shutter", core_shutter, name="shutter")
-    await s.connect(mock=False)
-    await s.set(True)
-    loc = await s.locate()
-    assert loc["readback"] is True
 
+class PropertyOnDevice(MMSystem):
+    wheel: A[Wheel, Property("Label")]
 
-async def test_shutter_emits_watcher_updates(core_shutter: CMMCorePlus) -> None:
-    core_shutter.deviceBusy.side_effect = [True, False]  # type: ignore[attr-defined]
-    s = MyShutter("Shutter", core_shutter, name="shutter")
-    await s.connect(mock=False)
-    updates, collect = _watcher_collector()
-    status = s.set(True)
-    status.watch(collect)
-    await status
-    assert len(updates) >= 1
-    assert updates[-1].target is True
 
+class UnmarkedCommand(MMDevice):
+    halt: Command[[], None]
 
-async def test_shutter_stop(core_shutter: CMMCorePlus) -> None:
-    core_shutter.deviceBusy.side_effect = lambda lbl: True  # type: ignore[attr-defined]
-    s = MyShutter("Shutter", core_shutter, name="shutter")
-    await s.connect(mock=False)
-    move = s.set(True)
-    await asyncio.sleep(0.02)
-    await s.stop(success=False)
-    with pytest.raises(Exception):
-        await move
 
+class OptionalUnmarked(MMSystem):
+    wheel: Wheel | None
 
-# ---------------------------------------------------------------------------
-# State device
-# ---------------------------------------------------------------------------
 
+class PropertyOnSystem(MMSystem):
+    power: A[SignalR[float], Property("Power")]
 
-MyFilterWheel = MMStateDevice
 
+@pytest.mark.parametrize(
+    ("cls", "make", "match"),
+    [
+        (Unmarked, lambda c, ctrl: c("Laser", ctrl), "Unmarked.power"),
+        (Doubled, lambda c, ctrl: c("Laser", ctrl), "Doubled.power"),
+        (LabelOnSignal, lambda c, ctrl: c("Laser", ctrl), "LabelOnSignal.power"),
+        (PropertyOnDevice, lambda c, ctrl: c(ctrl), "PropertyOnDevice.wheel"),
+        (UnmarkedCommand, lambda c, ctrl: c("Laser", ctrl), "UnmarkedCommand.halt"),
+        (OptionalUnmarked, lambda c, ctrl: c(ctrl), "OptionalUnmarked.wheel"),
+        (PropertyOnSystem, lambda c, ctrl: c(ctrl), "PropertyOnSystem.power"),
+    ],
+)
+def test_bad_marker_raises(bare_ctrl, cls, make, match):
+    """Refuse an annotated child with no marker, several, or one that does not fit."""
+    with pytest.raises(TypeError, match=match):
+        make(cls, bare_ctrl)
 
-@pytest.fixture
-def core_state() -> Generator[CMMCorePlus, None, None]:
-    instance = CMMCorePlus()
-    _state = {"label": "DAPI"}
 
-    with _base_patches(instance) as stack:
-        for cm in [patch.object(instance, "getStateLabel", side_effect=lambda lbl: _state["label"]),
-        patch.object(instance, "setStateLabel", side_effect=lambda lbl, v: _state.update({"label": v})),
-        patch.object(instance, "stop")]:
-            stack.enter_context(cm)
-        yield instance
-
-
-async def test_state_locate(core_state: CMMCorePlus) -> None:
-    fw = MyFilterWheel("FilterWheel", core_state, name="fw")
-    await fw.connect(mock=False)
-    loc = await fw.locate()
-    assert loc["readback"] == "DAPI"
-
-
-async def test_state_set(core_state: CMMCorePlus) -> None:
-    fw = MyFilterWheel("FilterWheel", core_state, name="fw")
-    await fw.connect(mock=False)
-    await fw.set("FITC")
-    core_state.setStateLabel.assert_called_with("FilterWheel", "FITC")  # type: ignore[attr-defined]
-
-
-async def test_state_locate_reflects_set(core_state: CMMCorePlus) -> None:
-    fw = MyFilterWheel("FilterWheel", core_state, name="fw")
-    await fw.connect(mock=False)
-    await fw.set("FITC")
-    loc = await fw.locate()
-    assert loc["readback"] == "FITC"
-
-
-async def test_state_emits_watcher_updates(core_state: CMMCorePlus) -> None:
-    core_state.deviceBusy.side_effect = [True, False]  # type: ignore[attr-defined]
-    fw = MyFilterWheel("FilterWheel", core_state, name="fw")
-    await fw.connect(mock=False)
-    updates, collect = _watcher_collector()
-    status = fw.set("FITC")
-    status.watch(collect)
-    await status
-    assert len(updates) >= 1
-    assert updates[-1].target == "FITC"
-
-
-async def test_state_stop(core_state: CMMCorePlus) -> None:
-    core_state.deviceBusy.side_effect = lambda lbl: True  # type: ignore[attr-defined]
-    fw = MyFilterWheel("FilterWheel", core_state, name="fw")
-    await fw.connect(mock=False)
-    move = fw.set("FITC")
-    await asyncio.sleep(0.02)
-    await fw.stop(success=False)
-    with pytest.raises(Exception):
-        await move
-
-
-# ---------------------------------------------------------------------------
-# AutoFocus
-# ---------------------------------------------------------------------------
-
-
-MyAutoFocus = MMAutoFocus
-
-
-@pytest.fixture
-def core_af() -> Generator[CMMCorePlus, None, None]:
-    instance = CMMCorePlus()
-    _state = {"offset": 0.0, "locked": False}
-
-    with _base_patches(instance) as stack:
-        for cm in [patch.object(instance, "getAutoFocusOffset", side_effect=lambda: _state["offset"]),
-        patch.object(instance, "setAutoFocusOffset", side_effect=lambda v: _state.update({"offset": v})),
-        patch.object(instance, "fullFocus"),
-        patch.object(instance, "isContinuousFocusLocked", side_effect=lambda: _state["locked"])]:
-            stack.enter_context(cm)
-        yield instance
-
-
-async def test_af_locate(core_af: CMMCorePlus) -> None:
-    af = MyAutoFocus("AutoFocus", core_af, name="af")
-    await af.connect(mock=False)
-    loc = await af.locate()
-    assert loc["readback"] == pytest.approx(0.0)
-
-
-async def test_af_set_offset(core_af: CMMCorePlus) -> None:
-    af = MyAutoFocus("AutoFocus", core_af, name="af")
-    await af.connect(mock=False)
-    await af.set(10.0)
-    core_af.setAutoFocusOffset.assert_called_with(10.0)  # type: ignore[attr-defined]
-
-
-async def test_af_locate_reflects_set(core_af: CMMCorePlus) -> None:
-    af = MyAutoFocus("AutoFocus", core_af, name="af")
-    await af.connect(mock=False)
-    await af.set(10.0)
-    loc = await af.locate()
-    assert loc["readback"] == pytest.approx(10.0)
-
-
-async def test_af_trigger_calls_full_focus(core_af: CMMCorePlus) -> None:
-    # Make isContinuousFocusLocked return True on second call so trigger exits
-    core_af.isContinuousFocusLocked.side_effect = [False, True]  # type: ignore[attr-defined]
-    af = MyAutoFocus("AutoFocus", core_af, name="af")
-    await af.connect(mock=False)
-    await af.trigger()
-    core_af.fullFocus.assert_called_once()  # type: ignore[attr-defined]
-
-
-async def test_af_stop(core_af: CMMCorePlus) -> None:
-    core_af.deviceBusy.side_effect = lambda lbl: True  # type: ignore[attr-defined]
-    af = MyAutoFocus("AutoFocus", core_af, name="af")
-    await af.connect(mock=False)
-    move = af.set(50.0)
-    await asyncio.sleep(0.02)
-    await af.stop(success=False)
-    with pytest.raises(Exception):
-        await move
-
-
-# ---------------------------------------------------------------------------
-# Galvo
-# ---------------------------------------------------------------------------
-
-
-class MyGalvo(MMGalvo):
-    _dwell_us = 500.0
-
-
-@pytest.fixture
-def core_galvo() -> Generator[CMMCorePlus, None, None]:
-    instance = CMMCorePlus()
-    _pos = {"x": 0.0, "y": 0.0}
-
-    with _base_patches(instance) as stack:
-        for cm in [patch.object(instance, "getGalvoPosition", side_effect=lambda lbl: (_pos["x"], _pos["y"])),
-        patch.object(instance, "setGalvoPosition", side_effect=lambda lbl, x, y: _pos.update({"x": x, "y": y})),
-        patch.object(instance, "pointGalvoAndFire")]:
-            stack.enter_context(cm)
-        yield instance
-
-
-async def test_galvo_locate(core_galvo: CMMCorePlus) -> None:
-    g = MyGalvo("Galvo", core_galvo, name="galvo")
-    await g.connect(mock=False)
-    loc = await g.locate()
-    assert loc["readback"] == (pytest.approx(0.0), pytest.approx(0.0))
-
-
-async def test_galvo_set(core_galvo: CMMCorePlus) -> None:
-    g = MyGalvo("Galvo", core_galvo, name="galvo")
-    await g.connect(mock=False)
-    await g.set((100.0, 200.0))
-    core_galvo.setGalvoPosition.assert_called_with("Galvo", 100.0, 200.0)  # type: ignore[attr-defined]
-
-
-async def test_galvo_locate_reflects_set(core_galvo: CMMCorePlus) -> None:
-    g = MyGalvo("Galvo", core_galvo, name="galvo")
-    await g.connect(mock=False)
-    await g.set((100.0, 200.0))
-    loc = await g.locate()
-    assert loc["readback"] == (pytest.approx(100.0), pytest.approx(200.0))
-
-
-async def test_galvo_trigger_fires(core_galvo: CMMCorePlus) -> None:
-    g = MyGalvo("Galvo", core_galvo, name="galvo")
-    await g.connect(mock=False)
-    await g.set((50.0, 75.0))
-    await g.trigger()
-    core_galvo.pointGalvoAndFire.assert_called_with("Galvo", 50.0, 75.0, 500.0)  # type: ignore[attr-defined]
-
-
-# ---------------------------------------------------------------------------
-# Pump
-# ---------------------------------------------------------------------------
-
-
-MyPump = MMPump
-
-
-@pytest.fixture
-def core_pump() -> Generator[CMMCorePlus, None, None]:
-    instance = CMMCorePlus()
-    _state = {"volume": 0.0}
-
-    with _base_patches(instance) as stack:
-        for cm in [patch.object(instance, "getPumpVolume", side_effect=lambda lbl: _state["volume"]),
-        patch.object(instance, "pumpDispenseVolumeUl", side_effect=lambda lbl, v: _state.update({"volume": v})),
-        patch.object(instance, "volumetricPumpStop")]:
-            stack.enter_context(cm)
-        yield instance
-
-
-async def test_pump_set_dispenses(core_pump: CMMCorePlus) -> None:
-    p = MyPump("Pump", core_pump, name="pump")
-    await p.connect(mock=False)
-    await p.set(50.0)
-    core_pump.pumpDispenseVolumeUl.assert_called_with("Pump", 50.0)  # type: ignore[attr-defined]
-
-
-async def test_pump_emits_watcher_updates(core_pump: CMMCorePlus) -> None:
-    core_pump.deviceBusy.side_effect = [True, False]  # type: ignore[attr-defined]
-    p = MyPump("Pump", core_pump, name="pump")
-    await p.connect(mock=False)
-    updates, collect = _watcher_collector()
-    status = p.set(50.0)
-    status.watch(collect)
-    await status
-    assert len(updates) >= 1
-    assert updates[-1].target == pytest.approx(50.0)
-
-
-async def test_pump_stop(core_pump: CMMCorePlus) -> None:
-    core_pump.deviceBusy.side_effect = lambda lbl: True  # type: ignore[attr-defined]
-    p = MyPump("Pump", core_pump, name="pump")
-    await p.connect(mock=False)
-    dispense = p.set(100.0)
-    await asyncio.sleep(0.02)
-    await p.stop(success=False)
-    with pytest.raises(Exception):
-        await dispense
-    core_pump.volumetricPumpStop.assert_called_with("Pump")  # type: ignore[attr-defined]
+def test_label_and_connector_are_exclusive(bare_ctrl):
+    """Refuse a device given both a label and a connector."""
+    with pytest.raises(ValueError):
+        MMDevice("Wheel", bare_ctrl, connector=MMConnector(bare_ctrl, "Wheel"))
+
+
+def test_device_needs_a_label_or_a_connector():
+    """Refuse a device given neither a controller nor a connector."""
+    with pytest.raises(ValueError):
+        MMDevice("Wheel")
+
+
+async def test_shutter_opens(ctrl):
+    """Open the shutter and read it back as open."""
+    async with init_devices():
+        shutter = MMShutter("Shutter", ctrl)
+    await shutter.set(True)
+    assert await shutter.position.get_value() is True
+
+
+async def test_state_device_moves_by_label(ctrl):
+    """Move a state device by label and describe its labels as choices."""
+    async with init_devices():
+        wheel = MMStateDevice("Wheel", ctrl)
+    await wheel.set("C")
+    assert await wheel.position.get_value() == "C"
+    assert (await wheel.describe())["wheel"].get("choices") == ["A", "B", "C", "D"]
+
+
+async def test_config_group_applies_preset(ctrl, uni_core):
+    """Apply a preset and read it back, or an empty name when none matches."""
+    async with init_devices():
+        channel = MMConfigGroup("Channel", ctrl)
+    await channel.set("B")
+    assert await channel.position.get_value() == "B"
+    uni_core.setProperty("Wheel", "Label", "D")
+    assert await channel.position.get_value() == ""
+    assert await channel.locate() == {"setpoint": "B", "readback": ""}
+
+
+async def test_rejected_state_keeps_previous_target(ctrl):
+    """Keep the last target when the core refuses a state label."""
+    async with init_devices():
+        wheel = MMStateDevice("Wheel", ctrl)
+    await wheel.set("B")
+    with pytest.raises(RuntimeError, match="Label not defined"):
+        await wheel.set("Z")
+    assert await wheel.locate() == {"setpoint": "B", "readback": "B"}
+
+
+@pytest.mark.parametrize(
+    ("cls", "options"),
+    [
+        (MMShutter, {"properties": ["Name"]}),
+        (MMStateDevice, {"move_timeout": 3.0}),
+        (MMConfigGroup, {"move_timeout": 3.0}),
+    ],
+)
+def test_connector_excludes_options(bare_ctrl, cls, options):
+    """Refuse a device given a connector together with an option the connector holds."""
+    with pytest.raises(ValueError):
+        cls(connector=MMConnector(bare_ctrl, "Wheel"), **options)
+
+
+class Scope(MMSystem):
+    z: A[MMZStage, Label("Z"), Format.CHILD]
+    xy: A[MMXYStage, Label("XY")]
+    shutter: A[MMShutter, Label("Shutter")]
+    channel: A[MMConfigGroup, Label("Channel")]
+
+
+async def test_system_moves_declared_devices(ctrl):
+    """Move every kind of declared child of a system with the system's move timeout."""
+    async with init_devices():
+        scope = Scope(ctrl, move_timeout=5.0)
+    await asyncio.gather(
+        scope.z.set(4.0),
+        scope.xy.x.set(1.0),
+        scope.shutter.set(True),
+        scope.channel.set("B"),
+    )
+    assert (await scope.describe()).keys() == {"scope-z"}
+    assert await scope.xy.x.position.get_value() == 1.0
+    assert scope.xy.x.movable_logic.move_timeout == 5.0
+
+
+@pytest.mark.parametrize(
+    ("build", "signal", "change", "initial", "expected"),
+    [
+        (
+            lambda ctrl: MMZStage("Z", ctrl),
+            lambda d: d.position,
+            lambda core: core.events.stagePositionChanged.emit("Z", 4.0),
+            0.0,
+            4.0,
+        ),
+        (
+            lambda ctrl: MMXYStage("XY", ctrl),
+            lambda d: d.x.position,
+            lambda core: core.events.XYStagePositionChanged.emit("XY", 1.0, 2.0),
+            0.0,
+            1.0,
+        ),
+        (
+            lambda ctrl: MMXYStage("XY", ctrl),
+            lambda d: d.y.position,
+            lambda core: core.events.XYStagePositionChanged.emit("XY", 1.0, 2.0),
+            0.0,
+            2.0,
+        ),
+        (
+            lambda ctrl: MMShutter("Shutter", ctrl),
+            lambda d: d.position,
+            lambda core: core.setShutterOpen("Shutter", True),
+            False,
+            True,
+        ),
+        (
+            lambda ctrl: MMStateDevice("Wheel", ctrl),
+            lambda d: d.position,
+            lambda core: core.setState("Wheel", 2),
+            "A",
+            "C",
+        ),
+        (
+            lambda ctrl: MMStateDevice("Wheel", ctrl),
+            lambda d: d.position,
+            lambda core: core.setStateLabel("Wheel", "D"),
+            "A",
+            "D",
+        ),
+        (
+            lambda ctrl: MMConfigGroup("Channel", ctrl),
+            lambda d: d.position,
+            lambda core: core.setConfig("Channel", "B"),
+            "A",
+            "B",
+        ),
+    ],
+    ids=["z", "x", "y", "shutter", "state", "state-label", "config-group"],
+)
+async def test_change_on_the_core_reaches_the_position_signal(
+    ctrl, uni_core, build, signal, change, initial, expected
+):
+    """Deliver a change the core reports to a subscriber of the position signal."""
+    async with init_devices():
+        device = build(ctrl)
+    with MonitorQueue(signal(device)) as queue:
+        await queue.assert_updates(initial)
+        change(uni_core)
+        await queue.assert_updates(expected)
+
+
+class GroupProperty(MMConfigGroup):
+    power: A[SignalRW[float], Property("Power")]
+
+
+class GroupHalt(MMConfigGroup):
+    halt: A[TriggerableCommand, Halt()]
+
+
+@pytest.mark.parametrize(
+    ("cls", "match"),
+    [(GroupProperty, "GroupProperty.power"), (GroupHalt, "GroupHalt.halt")],
+)
+def test_config_group_refuses_property_and_halt(bare_ctrl, cls, match):
+    """Refuse a Property or a Halt declared on a configuration group."""
+    with pytest.raises(TypeError, match=match):
+        cls("Channel", bare_ctrl)

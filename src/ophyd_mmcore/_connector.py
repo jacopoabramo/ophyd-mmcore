@@ -1,232 +1,279 @@
-"""Declarative device connector for Micro-Manager backed devices.
+import re
+import types
+import typing
+from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Annotated, Any, Literal, Union, get_args, get_origin
 
-Usage
------
-Instead of manually constructing signals in ``__init__``, subclass
-:class:`MMDevice` and declare signals as annotated class attributes::
+from ophyd_async.core import (
+    Command,
+    Device,
+    DeviceConnector,
+    DeviceFiller,
+    PathProvider,
+    Signal,
+)
 
-    from typing import Annotated as A
-    from ophyd_async.core import SignalR, SignalRW
-    from ophyd_async.core import StandardReadableFormat as Format
-    from ophyd_mmcore import MMDevice
-    from ophyd_mmcore._connector import PropName
-
-
-    class MMCamera(MMDevice):
-        exposure: A[SignalRW[float], PropName("Exposure"), Format.HINTED_SIGNAL]
-        binning: A[SignalRW[str], PropName("Binning"), Format.CONFIG_SIGNAL]
-        read_mode: A[SignalR[str], PropName("ReadMode"), Format.CONFIG_SIGNAL]
-
-The connector reads the ``PropName`` annotation to wire each signal to
-the corresponding Micro-Manager device property, using the shared
-:class:`~ophyd_mmcore._worker.MMCoreWorker` passed to ``MMDevice.__init__``.
-
-Pre-arranged :class:`CoreMethod` instances are provided for properties that
-have dedicated API methods on ``CMMCorePlus``:
-
-- :data:`ExposureMethod` — ``getExposure`` / ``setExposure``
-- :data:`ZPositionMethod` — ``getPosition`` / ``setPosition``
-- :data:`XPositionMethod` — ``getXPosition`` (read-only)
-- :data:`YPositionMethod` — ``getYPosition`` (read-only)
-- :data:`ShutterOpenMethod` — ``getShutterOpen`` / ``setShutterOpen``
-"""
-
-from __future__ import annotations
-
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, cast
-
-from ophyd_async.core import Device, DeviceConnector, DeviceFiller
-
-from ._backend import MMPropertyBackend
-
-if TYPE_CHECKING:
-    from collections.abc import Callable
-
-    from psygnal import SignalInstance
-    from pymmcore_plus import CMMCorePlus
-
-    from ._worker import MMCoreWorker
+from ._backend import MMCommandBackend, MMSignalBackend
+from ._camera_io import CameraValueName, OutputValueName
+from ._controller import MMController
 
 
-@dataclass
-class PropName:
-    """Annotation that maps a signal attribute to a MM device property name.
-
-    Parameters
-    ----------
-    name:
-        The Micro-Manager property name (e.g. ``"Exposure"``).
-
-    Examples
-    --------
-    ::
-
-        class MyDevice(MMDevice):
-            exposure: Annotated[
-                SignalRW[float], PropName("Exposure"), Format.HINTED_SIGNAL
-            ]
-    """
+@dataclass(frozen=True)
+class Property:
+    """Mark a signal that reads and writes the property `name` of the device's label."""
 
     name: str
 
 
-@dataclass
-class CoreMethod:
-    """Annotation that maps a signal to dedicated ``CMMCorePlus`` API methods.
+@dataclass(frozen=True)
+class Label:
+    """Mark a child device addressed by a Micro-Manager label.
 
-    Use this instead of :class:`PropName` when MM exposes a typed getter/setter
-    (e.g. ``getExposure``/``setExposure``) that should be preferred over the
-    generic ``getProperty``/``setProperty`` path.
-
-    Parameters
-    ----------
-    get:
-        Callable ``(core, label) -> value`` that reads the current value.
-    set:
-        Callable ``(core, label, value) -> None`` that writes a new value.
-        Omit for read-only signals.
-    event:
-        Callable ``(core) -> SignalInstance`` that returns the psygnal signal
-        to subscribe to for live updates.  The signal must emit
-        ``(label: str, value, ...)`` so the backend can filter by device label
-        and extract the new value.  Omit if live updates are not needed.
-
-    Examples
-    --------
-    Use a pre-arranged constant::
-
-        from ophyd_mmcore._connector import ExposureMethod
-
-
-        class MyCamera(MMDevice):
-            exposure: Annotated[SignalRW[float], ExposureMethod, Format.HINTED_SIGNAL]
-
-    Or define a custom one::
-
-        from ophyd_mmcore._connector import CoreMethod
-
-
-        class MyDevice(MMDevice):
-            pos: Annotated[
-                SignalRW[float],
-                CoreMethod(
-                    get=lambda core, label: core.getPosition(label),
-                    set=lambda core, label, v: core.setPosition(label, v),
-                    event=lambda core: core.events.stagePositionChanged,
-                ),
-            ]
+    `physical` lists the labels of the physical cameras of a multi-camera
+    device, and `properties` the properties to report in the child's
+    configuration.
     """
 
-    get: Callable[[CMMCorePlus, str], Any]
-    set: Callable[[CMMCorePlus, str, Any], None] | None = None
-    event: Callable[[CMMCorePlus], SignalInstance] | None = field(default=None)
-    event_value: Callable[..., Any] | None = field(default=None)
-    """Extract the value from event args after ``label``.
+    label: str
+    physical: tuple[str, ...] = ()
+    properties: tuple[str, ...] = ()
 
-    Defaults to taking the first argument.  Override for events that emit
-    multiple values — e.g. ``XYStagePositionChanged(label, x, y)``.
+
+@dataclass(frozen=True)
+class Position:
+    """Mark the position signal of a moving device, in micrometres for a stage."""
+
+
+@dataclass(frozen=True)
+class ShutterOpen:
+    """Mark the signal that is true when the shutter of the label is open."""
+
+
+@dataclass(frozen=True)
+class StateLabel:
+    """Mark the signal holding the label of the current state of the device."""
+
+
+@dataclass(frozen=True)
+class Preset:
+    """Mark the signal holding the current preset of the configuration group named by the label."""
+
+
+@dataclass(frozen=True)
+class Halt:
+    """Mark the command that stops the device's label."""
+
+
+@dataclass(frozen=True)
+class XYAxis:
+    """Mark a child device that is one axis of the parent's XY stage."""
+
+    axis: Literal["x", "y"]
+
+
+@dataclass(frozen=True)
+class CameraValue:
+    """Mark the camera's exposure or one of its sequence flags."""
+
+    name: CameraValueName
+
+
+@dataclass(frozen=True)
+class OutputValue:
+    """Mark a frame layout value or a store signal of the connector's output."""
+
+    name: OutputValueName
+
+
+SIGNAL_MARKERS = (
+    Property,
+    Position,
+    ShutterOpen,
+    StateLabel,
+    Preset,
+    CameraValue,
+    OutputValue,
+)
+COMMAND_MARKERS = (Halt,)
+DEVICE_MARKERS = (Label, XYAxis)
+MARKERS = SIGNAL_MARKERS + COMMAND_MARKERS + DEVICE_MARKERS
+
+
+def clean_name(name: str) -> str:
+    """Turn a Micro-Manager name into a lower-case identifier.
+
+    Camel case is split and every run of characters other than letters and
+    digits becomes `_`, so `"CCDTemperature RO"` becomes `"ccd_temperature_ro"`.
+    """
+    split = re.sub(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", "_", name)
+    return re.sub(r"[^A-Za-z0-9]+", "_", split).strip("_").lower()
+
+
+def take_marker(extras: list[Any]) -> Any:
+    """Remove and return the marker among a child's annotations."""
+    marker = next(extra for extra in extras if isinstance(extra, MARKERS))
+    extras.remove(marker)
+    return marker
+
+
+class MMConnector(DeviceConnector):
+    """Builds the declared children of a device from their markers.
+
+    Holds what a device needs to address the core: the controller, the label
+    and the options of the device.
     """
 
-
-# ---------------------------------------------------------------------------
-# Pre-arranged CoreMethod constants
-# ---------------------------------------------------------------------------
-
-ExposureMethod: CoreMethod = CoreMethod(
-    get=lambda core, label: core.getExposure(label),
-    set=lambda core, label, v: core.setExposure(label, v),
-    event=lambda core: core.events.exposureChanged,
-)
-"""CoreMethod for camera exposure (``getExposure`` / ``setExposure``)."""
-
-ZPositionMethod: CoreMethod = CoreMethod(
-    get=lambda core, label: core.getPosition(label),
-    set=lambda core, label, v: core.setPosition(label, v),
-    event=lambda core: core.events.stagePositionChanged,
-)
-"""CoreMethod for Z-stage position (``getPosition`` / ``setPosition``)."""
-
-XPositionMethod: CoreMethod = CoreMethod(
-    get=lambda core, label: core.getXPosition(label),
-    set=lambda core, label, v: core.setXYPosition(label, v, core.getYPosition(label)),
-    event=lambda core: core.events.XYStagePositionChanged,
-    event_value=lambda x, _: x,
-)
-"""CoreMethod for the X axis of an XY stage.
-
-The setter moves only X by reading the current Y and calling ``setXYPosition``.
-"""
-
-YPositionMethod: CoreMethod = CoreMethod(
-    get=lambda core, label: core.getYPosition(label),
-    set=lambda core, label, v: core.setXYPosition(label, core.getXPosition(label), v),
-    event=lambda core: core.events.XYStagePositionChanged,
-    event_value=lambda _, y: y,
-)
-"""CoreMethod for the Y axis of an XY stage.
-
-The setter moves only Y by reading the current X and calling ``setXYPosition``.
-"""
-
-ShutterOpenMethod: CoreMethod = CoreMethod(
-    get=lambda core, label: core.getShutterOpen(label),
-    set=lambda core, label, v: core.setShutterOpen(label, v),
-    event=lambda core: core.events.shutterOpenChanged,
-)
-"""CoreMethod for shutter open/closed state (``getShutterOpen`` / ``setShutterOpen``)."""
-
-
-# ---------------------------------------------------------------------------
-# MMDeviceConnector
-# ---------------------------------------------------------------------------
-
-
-class MMDeviceConnector(DeviceConnector):
-    """Connector that wires ``PropName``-annotated signals to MM properties.
-
-    Created automatically by :class:`~ophyd_mmcore._device.MMDevice` when
-    the class has ``PropName``-annotated attributes.  You do not normally
-    need to instantiate this directly.
-    """
-
-    def __init__(self, mm_label: str, worker: MMCoreWorker) -> None:
-        self._mm_label = mm_label
-        self._worker = worker
-
-    def create_children_from_annotations(self, device: Device) -> None:
-        if hasattr(self, "_filler"):
-            return  # already created
-
-        self._filler = DeviceFiller(
-            device,
-            signal_backend_factory=lambda datatype: MMPropertyBackend(
-                self._mm_label,
-                "",
-                self._worker,
-                cast("Any", datatype),  # DeviceFiller uses full SignalDatatype union
-            ),
-            device_connector_factory=DeviceConnector,
+    def __init__(
+        self,
+        ctrl: MMController,
+        label: str = "",
+        *,
+        axis: Literal["x", "y"] | None = None,
+        output: str | None = None,
+        physical: Sequence[str] = (),
+        properties: Sequence[str] = (),
+        path_provider: PathProvider | None = None,
+        move_timeout: float | None = 10.0,
+    ) -> None:
+        self.ctrl = ctrl
+        self.path_provider = path_provider
+        self.move_timeout = move_timeout
+        self.set_address(
+            label=label,
+            axis=axis,
+            output=output,
+            physical=physical,
+            properties=properties,
         )
 
-        for backend, ann in self._filler.create_signals_from_annotations():
-            _fill_backend_from_annotation(backend, ann)
+    def set_address(
+        self,
+        *,
+        label: str | None = None,
+        axis: Literal["x", "y"] | None = None,
+        output: str | None = None,
+        physical: Sequence[str] | None = None,
+        properties: Sequence[str] = (),
+    ) -> None:
+        """Replace the fields given, and clear `axis`, `output` and `properties` if not given."""
+        if label is not None:
+            self.label = label
+        if physical is not None:
+            self.physical = tuple(physical)
+        self.axis: Literal["x", "y"] | None = axis
+        self.output = output
+        self.properties = tuple(properties)
 
-        list(self._filler.create_devices_from_annotations())
+    def child(self) -> "MMConnector":
+        """Return a connector for a declared child, with the same controller and options."""
+        return MMConnector(
+            self.ctrl,
+            self.label,
+            physical=self.physical,
+            path_provider=self.path_provider,
+            move_timeout=self.move_timeout,
+        )
 
+    def property_backend(self, name: str) -> MMSignalBackend:
+        """Return a bound backend, with no declared datatype, for a property of the label."""
+        return MMSignalBackend(None, self.ctrl.property_source(self.label, name))
 
-def _fill_backend_from_annotation(
-    backend: MMPropertyBackend[Any], annotations: list[Any]
-) -> None:
-    """Consume ``PropName`` or ``CoreMethod`` annotations and configure the backend."""
-    unhandled = []
-    for annotation in annotations:
-        if isinstance(annotation, PropName):
-            backend.configure_prop(annotation.name)
-        elif isinstance(annotation, CoreMethod):
-            backend.configure_core_method(
-                annotation.get, annotation.set, annotation.event, annotation.event_value
-            )
-        else:
-            unhandled.append(annotation)
-    annotations[:] = unhandled
+    def check_markers(self, device: Device) -> None:
+        """Raise `TypeError` for a declared child whose marker is missing or does not fit."""
+        cls = type(device)
+        for attr, hint in typing.get_type_hints(cls, include_extras=True).items():
+            if attr == "parent" or attr.startswith("_"):
+                continue
+            extras: list[Any] = []
+            if get_origin(hint) is Annotated:
+                hint, *extras = get_args(hint)
+            if get_origin(hint) in (Union, types.UnionType):
+                args = [arg for arg in get_args(hint) if arg is not types.NoneType]
+                if len(args) == 1:
+                    hint = args[0]
+            origin = get_origin(hint) or hint
+            if not (isinstance(origin, type) and issubclass(origin, Device)):
+                continue
+            if issubclass(origin, Signal):
+                allowed = SIGNAL_MARKERS
+            elif issubclass(origin, Command):
+                allowed = COMMAND_MARKERS
+            else:
+                allowed = DEVICE_MARKERS
+            where = f"{cls.__name__}.{attr}"
+            markers = [extra for extra in extras if isinstance(extra, MARKERS)]
+            if len(markers) != 1:
+                raise TypeError(f"{where}: expected one marker, found {len(markers)}")
+            marker = markers[0]
+            if not isinstance(marker, allowed):
+                raise TypeError(
+                    f"{where}: {type(marker).__name__} does not fit a {origin.__name__}"
+                )
+            if isinstance(marker, getattr(cls, "refused_markers", ())):
+                raise TypeError(
+                    f"{where}: {type(marker).__name__} does not fit a {cls.__name__}"
+                )
+            if isinstance(marker, SIGNAL_MARKERS + COMMAND_MARKERS) and not self.label:
+                raise TypeError(
+                    f"{where}: {type(marker).__name__} needs a device with a label"
+                )
+
+    def create_children_from_annotations(self, device: Device) -> None:
+        """Create every annotated signal, command and device of `device`."""
+        if hasattr(self, "filler"):
+            return
+        self.check_markers(device)
+        self.filler = DeviceFiller(
+            device,
+            signal_backend_factory=MMSignalBackend,
+            device_connector_factory=self.child,
+            command_backend_factory=lambda sig: MMCommandBackend(),
+        )
+        for backend, extras in self.filler.create_signals_from_annotations():
+            marker = take_marker(extras)
+            match marker:
+                case Property(name):
+                    backend.bind(self.ctrl.property_source(self.label, name))
+                case Position():
+                    backend.bind(
+                        self.ctrl.position_source(self.label, self.axis or "z")
+                    )
+                case ShutterOpen():
+                    backend.bind(self.ctrl.shutter_source(self.label))
+                case StateLabel():
+                    backend.bind(self.ctrl.state_source(self.label))
+                case Preset():
+                    backend.bind(self.ctrl.preset_source(self.label))
+                case CameraValue(name):
+                    backend.bind(
+                        self.ctrl.camera_io(self.label, self.physical).source(name)
+                    )
+                case OutputValue(name) if self.output is not None:
+                    backend.bind(
+                        self.ctrl.camera_io(self.label, self.physical).output_source(
+                            self.output, name
+                        )
+                    )
+                case _:
+                    raise TypeError(f"{marker!r} does not fit a Signal")
+        for backend, extras in self.filler.create_commands_from_annotations():
+            marker = take_marker(extras)
+            match marker:
+                case Halt():
+                    backend.bind(
+                        self.ctrl.halt(self.label), f"mmcore://{self.label}/halt"
+                    )
+                case _:
+                    raise TypeError(f"{marker!r} does not fit a Command")
+        for connector, extras in self.filler.create_devices_from_annotations():
+            marker = take_marker(extras)
+            match marker:
+                case Label(label, physical, properties):
+                    connector.set_address(
+                        label=label, physical=physical, properties=properties
+                    )
+                case XYAxis(axis):
+                    connector.set_address(axis=axis)
+                case _:
+                    raise TypeError(f"{marker!r} does not fit a Device")

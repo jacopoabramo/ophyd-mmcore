@@ -1,0 +1,116 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test on Python ${{ matrix.python-version }}, ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.0
+
+      - name: Install the project
+        run: uv sync
+
+      - name: Run the checks
+        run: uv run prek run --all-files
+
+      - name: Install the Micro-Manager test adapters
+        run: uv run mmcore install --test-adapters
+
+      - name: Check the demo adapters are installed
+        shell: bash
+        run: uv run python -c "from pymmcore_plus import CMMCorePlus; names = set(CMMCorePlus().getDeviceAdapterNames()); assert {'DemoCamera', 'Utilities'} <= names, names"
+
+      - name: Run the tests
+        run: uv run pytest -q
+
+  build:
+    name: Build Package
+    needs: [test]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Check the changelog has a section for a final release
+        run: |
+          if [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            python3 scripts/release_notes.py extract "${GITHUB_REF_NAME#v}" > /dev/null
+          fi
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.3.0
+
+      - name: Build a binary wheel and a source tarball
+        run: uv build
+
+      - name: Store the distribution packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-package-distributions
+          path: dist/
+
+  publish-to-pypi:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+        name: pypi
+        url: https://pypi.org/p/ophyd-mmcore
+    permissions:
+        id-token: write  # IMPORTANT: mandatory for trusted publishing
+    steps:
+        - name: Download all the dists
+          uses: actions/download-artifact@v8
+          with:
+            name: python-package-distributions
+            path: dist/
+        - name: Publish distribution to PyPI
+          uses: pypa/gh-action-pypi-publish@release/v1
+
+  # final tags only: a release candidate's entries stay in changelog.d for
+  # the final release's section
+  github-release:
+    name: Write the GitHub release notes
+    needs: publish-to-pypi
+    if: ${{ !contains(github.ref_name, 'rc') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Write the release's notes from its changelog section
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/release_notes.py extract "${GITHUB_REF_NAME#v}" > notes.md
+          # a release published from the interface already exists; a tag pushed
+          # from a clone has none yet
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file notes.md
+          fi

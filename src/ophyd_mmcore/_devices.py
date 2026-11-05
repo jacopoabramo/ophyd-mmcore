@@ -1,675 +1,301 @@
-"""Concrete ophyd-async devices for Micro-Manager device types.
-
-Each class inherits from :class:`~ophyd_mmcore.MMDevice`, which supplies
-``_mm_label``, ``_worker``, and the ``StandardReadable`` property-signal
-infrastructure.  The motion / control logic is implemented directly on the
-class, so no mixin or multiple inheritance is required.
-
-Extra properties are added by subclassing and annotating with ``PropName``::
-
-    from typing import Annotated as A
-    from ophyd_async.core import SignalRW, StandardReadableFormat as Format
-    from ophyd_mmcore._devices import MMShutter
-    from ophyd_mmcore._connector import PropName
-
-
-    class MyShutter(MMShutter):
-        delay_ms: A[SignalRW[float], PropName("ClosingDelay"), Format.CONFIG_SIGNAL]
-
-====================  =====================================  ======================================================
-Device type           MM API                                 Bluesky protocols
-====================  =====================================  ======================================================
-Shutter               setShutterOpen / getShutterOpen        Movable[bool], Locatable[bool]
-State device          setState / getState / getStateLabel    Movable[str], Locatable[str]
-AutoFocus             fullFocus / getAutoFocusOffset         Movable[float] (offset), Triggerable (snap focus)
-Galvo                 setGalvoPosition / pointGalvoAndFire   Movable[tuple], Triggerable (fire)
-Pump (volumetric)     pumpDispenseVolumeUl / pumpStop        Movable[float] (volume), Stoppable
-====================  =====================================  ======================================================
-
-Z stage and XY stage are defined below.
-
-Laser / generic devices whose entire API is property-based need no subclass —
-``PropName`` annotations on a plain ``MMDevice`` subclass are sufficient.
-"""
-
-from __future__ import annotations
-
-import asyncio
-from typing import TYPE_CHECKING
+from collections.abc import Sequence
+from dataclasses import dataclass
+from functools import cached_property
 from typing import Annotated as A
+from typing import ClassVar, Literal
 
 from bluesky.protocols import Location
 from ophyd_async.core import (
-    AsyncStatus,
+    DeviceMap,
+    MovableLogic,
+    PathProvider,
+    SignalDatatypeT,
     SignalRW,
-    WatchableAsyncStatus,
-    WatcherUpdate,
+    StandardMovable,
+    StandardReadable,
+    TimeoutCalculator,
+    TriggerableCommand,
 )
-from ophyd_async.core import (
-    StandardReadableFormat as Format,
+from ophyd_async.core import StandardReadableFormat as Format
+
+from ._connector import (
+    Halt,
+    MMConnector,
+    Preset,
+    Property,
+    ShutterOpen,
+    StateLabel,
+    clean_name,
 )
-
-from ._base import MMDevice
-from ._connector import XPositionMethod, YPositionMethod, ZPositionMethod
-
-if TYPE_CHECKING:
-    from pymmcore_plus import CMMCorePlus
+from ._controller import MMController
 
 
-# ---------------------------------------------------------------------------
-# Shutter
-# ---------------------------------------------------------------------------
+def property_map(connector: MMConnector) -> DeviceMap[SignalRW]:
+    """Return a signal for each of the connector's properties, keyed by its cleaned name.
+
+    Raises
+    ------
+    ValueError
+        If two properties have the same cleaned name.
+    """
+    signals: dict[str, SignalRW] = {}
+    raw_names: dict[str, str] = {}
+    for prop in connector.properties:
+        key = clean_name(prop)
+        if key in signals:
+            raise ValueError(
+                f"Properties {raw_names[key]!r} and {prop!r} both become {key!r}"
+            )
+        raw_names[key] = prop
+        signals[key] = SignalRW(connector.property_backend(prop))
+    return DeviceMap(signals)
 
 
-class MMShutter(MMDevice):
-    """Micro-Manager shutter device.
+class MMDevice(StandardReadable):
+    """A Micro-Manager device, addressed by its label.
 
-    ``set(True)`` opens the shutter; ``set(False)`` closes it.
-    ``locate()`` returns the current open/closed state as both setpoint
-    and readback.
-
-    Parameters
-    ----------
-    mm_label:
-        Micro-Manager device label (e.g. ``"Shutter"``).
-    core:
-        The shared ``CMMCorePlus`` instance.
-    name:
-        ophyd-async device name.
+    Pass either `label` with `ctrl`, or a `connector`, as a declared child
+    receives. Annotated signals are declared with [`Property`][ophyd_mmcore.Property].
+    Each name in `properties` becomes a signal in the `properties` map, which
+    `read_configuration` reports.
     """
 
-    def __init__(self, mm_label: str, core: CMMCorePlus, name: str = "") -> None:
-        self._shutter_wakeup: asyncio.Event | None = None
-        self._shutter_stopped = False
-        self._shutter_set_success = True
-        super().__init__(mm_label, core, name=name)
-
-    async def locate(self) -> Location[bool]:
-        """Return the current open state as both setpoint and readback."""
-        state: bool = await self._worker.run(
-            lambda: self._worker.core.getShutterOpen(self._mm_label)
-        )
-        return Location(setpoint=state, readback=state)
-
-    @WatchableAsyncStatus.wrap
-    async def set(self, value: bool):  # type: ignore[override]
-        """Open (``True``) or close (``False``) the shutter."""
-        loop = asyncio.get_running_loop()
-        wakeup = asyncio.Event()
-        self._shutter_wakeup = wakeup
-        self._shutter_stopped = False
-        self._shutter_set_success = True
-
-        initial: bool = await self._worker.run(
-            lambda: self._worker.core.getShutterOpen(self._mm_label)
-        )
-        current = initial
-
-        def _on_changed(label: str, state: bool) -> None:
-            nonlocal current
-            if label == self._mm_label:
-                current = state
-                loop.call_soon_threadsafe(wakeup.set)
-
-        self._worker.core.events.shutterOpenChanged.connect(_on_changed)
-        await self._worker.run(
-            lambda: self._worker.core.setShutterOpen(self._mm_label, value)
-        )
-
-        try:
-            while True:
-                wakeup.clear()
-                busy: bool = await self._worker.run(
-                    lambda: self._worker.core.deviceBusy(self._mm_label)
+    def __init__(
+        self,
+        label: str = "",
+        ctrl: MMController | None = None,
+        *,
+        properties: Sequence[str] = (),
+        name: str = "",
+        connector: MMConnector | None = None,
+    ) -> None:
+        if connector is not None:
+            if label or ctrl is not None or properties:
+                raise ValueError(
+                    "MMDevice takes either a connector or a label, ctrl and "
+                    "properties, not both"
                 )
-                yield WatcherUpdate(
-                    current=current,
-                    initial=initial,
-                    target=value,
-                    name=self.name,
-                )
-                if not busy or self._shutter_stopped:
-                    break
-                try:
-                    await asyncio.wait_for(wakeup.wait(), timeout=0.1)
-                except asyncio.TimeoutError:
-                    pass
-        finally:
-            self._worker.core.events.shutterOpenChanged.disconnect(_on_changed)
-            self._shutter_wakeup = None
+        elif ctrl is None:
+            raise ValueError("MMDevice needs either a ctrl or a connector")
+        else:
+            connector = MMConnector(ctrl, label, properties=properties)
+        self._label = connector.label
+        self._mm_connector = connector
+        super().__init__(name=name, connector=connector)
+        with self.add_children_as_readables(Format.CONFIG_SIGNAL):
+            self.properties = property_map(connector)
 
-        if not self._shutter_set_success:
-            raise RuntimeError(f"{self.name}: shutter move was stopped")
-
-    async def stop(self, success: bool = True) -> None:
-        """Interrupt a shutter transition."""
-        self._shutter_set_success = success
-        self._shutter_stopped = True
-        if self._shutter_wakeup is not None:
-            self._shutter_wakeup.set()
+    @property
+    def label(self) -> str:
+        """The Micro-Manager label of the device."""
+        return self._label
 
 
-# ---------------------------------------------------------------------------
-# State device  (filter wheels, objective turrets, etc.)
-# ---------------------------------------------------------------------------
+class MMSystem(StandardReadable):
+    """A microscope declared as a class, whose children are marked with [`Label`][ophyd_mmcore.Label]."""
+
+    def __init__(
+        self,
+        ctrl: MMController,
+        *,
+        path_provider: PathProvider | None = None,
+        move_timeout: float | None = 10.0,
+        name: str = "",
+    ) -> None:
+        super().__init__(
+            name=name,
+            connector=MMConnector(
+                ctrl, path_provider=path_provider, move_timeout=move_timeout
+            ),
+        )
 
 
-class MMStateDevice(MMDevice):
-    """Micro-Manager state device (filter wheel, objective turret, etc.).
+@dataclass
+class MMMoveLogic(MovableLogic[SignalDatatypeT]):
+    """How a device moves: a put on `setpoint` returns once the device is idle.
 
-    ``set("DAPI")`` selects the named position; ``locate()`` returns the
-    current label as both setpoint and readback.
-
-    To move by integer index instead, use ``PropName("State")`` directly.
-
-    Parameters
-    ----------
-    mm_label:
-        Micro-Manager device label (e.g. ``"FilterWheel"``).
-    core:
-        The shared ``CMMCorePlus`` instance.
-    name:
-        ophyd-async device name.
+    `halt` stops the move, and `move_timeout` is the time a move may take, or
+    `None` for no limit.
     """
 
-    def __init__(self, mm_label: str, core: CMMCorePlus, name: str = "") -> None:
-        self._state_wakeup: asyncio.Event | None = None
-        self._state_stopped = False
-        self._state_set_success = True
-        super().__init__(mm_label, core, name=name)
+    halt: TriggerableCommand | None
+    move_timeout: float | None
 
-    async def locate(self) -> Location[str]:
-        """Return the current state label."""
-        label: str = await self._worker.run(
-            lambda: self._worker.core.getStateLabel(self._mm_label)
-        )
-        return Location(setpoint=label, readback=label)
+    async def move(
+        self, new_position: SignalDatatypeT, timeout: TimeoutCalculator
+    ) -> None:
+        """Put `new_position` on the setpoint signal."""
+        await self.setpoint.set(new_position, timeout=timeout())
 
-    @WatchableAsyncStatus.wrap
-    async def set(self, value: str):  # type: ignore[override]
-        """Move to the named state position (e.g. ``"DAPI"``)."""
-        loop = asyncio.get_running_loop()
-        wakeup = asyncio.Event()
-        self._state_wakeup = wakeup
-        self._state_stopped = False
-        self._state_set_success = True
+    async def stop(self) -> None:
+        """Run `halt`, if there is one."""
+        if self.halt is not None:
+            await self.halt.trigger()
 
-        initial: str = await self._worker.run(
-            lambda: self._worker.core.getStateLabel(self._mm_label)
-        )
-        current = initial
-
-        def _on_changed(label: str, prop: str, val: str) -> None:
-            nonlocal current
-            if label == self._mm_label and prop == "Label":
-                current = val
-                loop.call_soon_threadsafe(wakeup.set)
-
-        self._worker.core.events.propertyChanged.connect(_on_changed)
-        await self._worker.run(
-            lambda: self._worker.core.setStateLabel(self._mm_label, value)
-        )
-
-        try:
-            while True:
-                wakeup.clear()
-                busy: bool = await self._worker.run(
-                    lambda: self._worker.core.deviceBusy(self._mm_label)
-                )
-                yield WatcherUpdate(
-                    current=current,
-                    initial=initial,
-                    target=value,
-                    name=self.name,
-                )
-                if not busy or self._state_stopped:
-                    break
-                try:
-                    await asyncio.wait_for(wakeup.wait(), timeout=0.1)
-                except asyncio.TimeoutError:
-                    pass
-        finally:
-            self._worker.core.events.propertyChanged.disconnect(_on_changed)
-            self._state_wakeup = None
-
-        if not self._state_set_success:
-            raise RuntimeError(f"{self.name}: state move was stopped")
-
-    async def stop(self, success: bool = True) -> None:
-        """Interrupt a state transition."""
-        self._state_set_success = success
-        self._state_stopped = True
-        await self._worker.run(lambda: self._worker.core.stop(self._mm_label))
-        if self._state_wakeup is not None:
-            self._state_wakeup.set()
+    async def calculate_timeout(
+        self, old_position: SignalDatatypeT, new_position: SignalDatatypeT
+    ) -> float | None:
+        """Return `move_timeout`."""
+        return self.move_timeout
 
 
-# ---------------------------------------------------------------------------
-# AutoFocus
-# ---------------------------------------------------------------------------
+class MMMovable(StandardMovable[SignalDatatypeT]):
+    """A device that moves through [`MMMoveLogic`][ophyd_mmcore.MMMoveLogic]."""
+
+    async def locate(self) -> Location[SignalDatatypeT]:
+        """Return the stored target as the setpoint and the hardware value as the readback."""
+        return await self.movable_logic.setpoint.locate()
 
 
-class MMAutoFocus(MMDevice):
-    """Micro-Manager autofocus device.
+def movable_connector(
+    label: str,
+    ctrl: MMController | None,
+    axis: Literal["x", "y"] | None,
+    properties: Sequence[str],
+    move_timeout: float | None,
+    connector: MMConnector | None,
+) -> tuple[str, MMController | None, Sequence[str], MMConnector | None]:
+    """Return the arguments for `MMDevice`, with the options of a moving device put into a connector."""
+    if connector is not None:
+        if axis is not None or properties or move_timeout != 10.0:
+            raise ValueError(
+                "A device given a connector takes no axis, properties or move_timeout"
+            )
+        return label, ctrl, properties, connector
+    if ctrl is None:
+        return label, ctrl, properties, connector
+    return (
+        "",
+        None,
+        (),
+        MMConnector(
+            ctrl, label, axis=axis, properties=properties, move_timeout=move_timeout
+        ),
+    )
 
-    ``set(offset)`` adjusts the focus offset (µm); ``locate()`` reads it
-    back.  ``trigger()`` runs a full focus snap and waits until the device
-    reports locked.
 
-    Parameters
-    ----------
-    mm_label:
-        Micro-Manager device label (e.g. ``"AutoFocus"``).
-    core:
-        The shared ``CMMCorePlus`` instance.
-    name:
-        ophyd-async device name.
+class MMShutter(MMMovable[bool], MMDevice):
+    """A shutter, moved by setting it open or closed.
+
+    A put on `position` returns when Micro-Manager reports the shutter idle,
+    and `halt` stops it. `move_timeout` is the seconds a move may take, and
+    `None` disables the limit. `properties` and `move_timeout` cannot be
+    combined with a `connector`.
     """
 
-    def __init__(self, mm_label: str, core: CMMCorePlus, name: str = "") -> None:
-        self._af_wakeup: asyncio.Event | None = None
-        self._af_stopped = False
-        self._af_set_success = True
-        super().__init__(mm_label, core, name=name)
+    position: A[SignalRW[bool], ShutterOpen(), Format.HINTED_SIGNAL]
+    halt: A[TriggerableCommand, Halt()]
 
-    async def locate(self) -> Location[float]:
-        """Return the current autofocus offset in µm."""
-        offset: float = await self._worker.run(
-            lambda: self._worker.core.getAutoFocusOffset()
+    def __init__(
+        self,
+        label: str = "",
+        ctrl: MMController | None = None,
+        *,
+        properties: Sequence[str] = (),
+        move_timeout: float | None = 10.0,
+        name: str = "",
+        connector: MMConnector | None = None,
+    ) -> None:
+        label, ctrl, properties, connector = movable_connector(
+            label, ctrl, None, properties, move_timeout, connector
         )
-        return Location(setpoint=offset, readback=offset)
-
-    @WatchableAsyncStatus.wrap
-    async def set(self, value: float):  # type: ignore[override]
-        """Move the autofocus offset to *value* µm."""
-        self._af_stopped = False
-        self._af_set_success = True
-
-        initial: float = await self._worker.run(
-            lambda: self._worker.core.getAutoFocusOffset()
+        super().__init__(
+            label, ctrl, properties=properties, name=name, connector=connector
         )
-        await self._worker.run(lambda: self._worker.core.setAutoFocusOffset(value))
 
-        current = initial
-        while not self._af_stopped:
-            busy: bool = await self._worker.run(
-                lambda: self._worker.core.deviceBusy(self._mm_label)
-            )
-            yield WatcherUpdate(
-                current=current,
-                initial=initial,
-                target=value,
-                name=self.name,
-                unit="µm",
-            )
-            if not busy:
-                break
-            current = await self._worker.run(
-                lambda: self._worker.core.getAutoFocusOffset()
-            )
-            await asyncio.sleep(0)
-
-        if not self._af_set_success:
-            raise RuntimeError(f"{self.name}: autofocus offset move was stopped")
-
-    @AsyncStatus.wrap
-    async def trigger(self) -> None:  # type: ignore[override]
-        """Run a full focus snap and wait until the device reports locked."""
-        await self._worker.run(lambda: self._worker.core.fullFocus())
-        while True:
-            locked: bool = await self._worker.run(
-                lambda: self._worker.core.isContinuousFocusLocked()
-            )
-            if locked:
-                break
-            busy: bool = await self._worker.run(
-                lambda: self._worker.core.deviceBusy(self._mm_label)
-            )
-            if not busy:
-                break
-            await asyncio.sleep(0)
-
-    async def stop(self, success: bool = True) -> None:
-        """Interrupt an in-progress offset move."""
-        self._af_set_success = success
-        self._af_stopped = True
+    @cached_property
+    def movable_logic(self) -> MMMoveLogic[bool]:
+        """The move logic of the shutter, built from `position` and `halt`."""
+        return MMMoveLogic(
+            setpoint=self.position,
+            readback=self.position,
+            halt=self.halt,
+            move_timeout=self._mm_connector.move_timeout,
+        )
 
 
-# ---------------------------------------------------------------------------
-# Galvo
-# ---------------------------------------------------------------------------
+class MMStateDevice(MMMovable[str], MMDevice):
+    """A device with named states, such as a filter wheel, moved by state label.
 
-GalvoPosition = tuple[float, float]
-
-
-class MMGalvo(MMDevice):
-    """Micro-Manager galvo device.
-
-    ``set((x, y))`` positions the mirrors; ``locate()`` reads the current
-    position.  ``trigger()`` fires at the current position using
-    :attr:`_dwell_us` microseconds dwell time.
-
-    Override ``_dwell_us`` on a subclass or per-instance to change the dwell
-    time if the ``DwellTime`` property is not available on the adapter::
-
-        class MyGalvo(MMGalvo):
-            _dwell_us = 500.0
-
-    Parameters
-    ----------
-    mm_label:
-        Micro-Manager device label.
-    core:
-        The shared ``CMMCorePlus`` instance.
-    name:
-        ophyd-async device name.
+    The labels of the device are the `choices` of the `position` signal. A put
+    on `position` returns when Micro-Manager reports the device idle, and
+    `halt` stops it. `move_timeout` is the seconds a move may take, and `None`
+    disables the limit. `properties` and `move_timeout` cannot be combined
+    with a `connector`.
     """
 
-    _dwell_us: float = 1000.0  # override per subclass or instance
+    position: A[SignalRW[str], StateLabel(), Format.HINTED_SIGNAL]
+    halt: A[TriggerableCommand, Halt()]
 
-    async def locate(self) -> Location[GalvoPosition]:
-        """Return the current galvo (x, y) position."""
-        pos = await self._worker.run(
-            lambda: self._worker.core.getGalvoPosition(self._mm_label)
+    def __init__(
+        self,
+        label: str = "",
+        ctrl: MMController | None = None,
+        *,
+        properties: Sequence[str] = (),
+        move_timeout: float | None = 10.0,
+        name: str = "",
+        connector: MMConnector | None = None,
+    ) -> None:
+        label, ctrl, properties, connector = movable_connector(
+            label, ctrl, None, properties, move_timeout, connector
         )
-        return Location(setpoint=tuple(pos), readback=tuple(pos))
-
-    @AsyncStatus.wrap
-    async def set(self, value: GalvoPosition) -> None:  # type: ignore[override]
-        """Position the galvo mirrors at *(x, y)*."""
-        x, y = value
-        await self._worker.run(
-            lambda: self._worker.core.setGalvoPosition(self._mm_label, x, y)
-        )
-
-    @AsyncStatus.wrap
-    async def trigger(self) -> None:  # type: ignore[override]
-        """Fire the galvo at its current position."""
-        dwell = self._dwell_us
-        pos = await self._worker.run(
-            lambda: self._worker.core.getGalvoPosition(self._mm_label)
-        )
-        x, y = pos
-        await self._worker.run(
-            lambda: self._worker.core.pointGalvoAndFire(self._mm_label, x, y, dwell)
+        super().__init__(
+            label, ctrl, properties=properties, name=name, connector=connector
         )
 
+    @cached_property
+    def movable_logic(self) -> MMMoveLogic[str]:
+        """The move logic of the device, built from `position` and `halt`."""
+        return MMMoveLogic(
+            setpoint=self.position,
+            readback=self.position,
+            halt=self.halt,
+            move_timeout=self._mm_connector.move_timeout,
+        )
 
-# ---------------------------------------------------------------------------
-# Volumetric pump
-# ---------------------------------------------------------------------------
 
+class MMConfigGroup(MMMovable[str], StandardReadable):
+    """A Micro-Manager configuration group, moved by preset name.
 
-class MMPump(MMDevice):
-    """Micro-Manager volumetric pump device.
-
-    ``set(volume_ul)`` dispenses *volume_ul* microlitres at the current
-    flowrate and waits for the dispense to complete.  ``stop()`` halts the
-    pump immediately.
-
-    Parameters
-    ----------
-    mm_label:
-        Micro-Manager device label.
-    core:
-        The shared ``CMMCorePlus`` instance.
-    name:
-        ophyd-async device name.
+    A put on `position` applies the preset and returns when every device it
+    touches is idle. `position` reads `""` when no preset matches the
+    hardware. A group has no `halt`, so `stop` returns at once. The presets
+    are the `choices` of the `position` signal. `move_timeout` is the seconds
+    a move may take, and `None` disables the limit. `move_timeout` cannot be
+    combined with a `connector`.
     """
 
-    def __init__(self, mm_label: str, core: CMMCorePlus, name: str = "") -> None:
-        self._pump_stopped = False
-        self._pump_set_success = True
-        super().__init__(mm_label, core, name=name)
+    refused_markers: ClassVar[tuple[type, ...]] = (Property, Halt)
+    position: A[SignalRW[str], Preset(), Format.HINTED_SIGNAL]
 
-    @WatchableAsyncStatus.wrap
-    async def set(self, value: float):  # type: ignore[override]
-        """Dispense *value* µL, yielding progress updates until done."""
-        self._pump_stopped = False
-        self._pump_set_success = True
-
-        await self._worker.run(
-            lambda: self._worker.core.pumpDispenseVolumeUl(self._mm_label, value)
+    def __init__(
+        self,
+        group: str = "",
+        ctrl: MMController | None = None,
+        *,
+        move_timeout: float | None = 10.0,
+        name: str = "",
+        connector: MMConnector | None = None,
+    ) -> None:
+        group, ctrl, _, connector = movable_connector(
+            group, ctrl, None, (), move_timeout, connector
         )
-
-        dispensed = 0.0
-        while not self._pump_stopped:
-            busy: bool = await self._worker.run(
-                lambda: self._worker.core.deviceBusy(self._mm_label)
+        if connector is None:
+            raise ValueError("MMConfigGroup needs either a ctrl or a connector")
+        if group or ctrl is not None:
+            raise ValueError(
+                "MMConfigGroup takes either a connector or a group and ctrl, not both"
             )
-            dispensed = value - await self._worker.run(
-                lambda: self._worker.core.getPumpVolume(self._mm_label)
-            )
-            yield WatcherUpdate(
-                current=dispensed,
-                initial=0.0,
-                target=value,
-                name=self.name,
-                unit="uL",
-            )
-            if not busy:
-                break
-            await asyncio.sleep(0)
+        self._mm_connector = connector
+        super().__init__(name=name, connector=connector)
 
-        if not self._pump_set_success:
-            raise RuntimeError(f"{self.name}: pump dispense was stopped")
-
-    async def stop(self, success: bool = True) -> None:
-        """Stop the pump immediately."""
-        self._pump_set_success = success
-        self._pump_stopped = True
-        await self._worker.run(
-            lambda: self._worker.core.volumetricPumpStop(self._mm_label)
+    @cached_property
+    def movable_logic(self) -> MMMoveLogic[str]:
+        """The move logic of the group, built from `position`."""
+        return MMMoveLogic(
+            setpoint=self.position,
+            readback=self.position,
+            halt=None,
+            move_timeout=self._mm_connector.move_timeout,
         )
-
-
-# ---------------------------------------------------------------------------
-# Z stage
-# ---------------------------------------------------------------------------
-
-
-class MMZStage(MMDevice):
-    """Micro-Manager Z (focus) stage.
-
-    ``position`` is a readable/writable signal for the current Z position in µm.
-    For moves with progress tracking use :meth:`set` instead.
-
-    Extra properties are added by subclassing::
-
-        from typing import Annotated as A
-        from ophyd_async.core import SignalRW, StandardReadableFormat as Format
-        from ophyd_mmcore import MMZStage
-        from ophyd_mmcore._connector import PropName
-
-
-        class ZStage(MMZStage):
-            velocity: A[SignalRW[float], PropName("Speed"), Format.CONFIG_SIGNAL]
-
-    Parameters
-    ----------
-    mm_label:
-        Micro-Manager device label (e.g. ``"ZStage"``).
-    core:
-        The shared ``CMMCorePlus`` instance.
-    name:
-        ophyd-async device name.
-    """
-
-    position: A[SignalRW[float], ZPositionMethod, Format.HINTED_SIGNAL]
-
-    def __init__(self, mm_label: str, core: CMMCorePlus, name: str = "") -> None:
-        self._z_wakeup: asyncio.Event | None = None
-        self._z_stopped = False
-        self._z_set_success = True
-        super().__init__(mm_label, core, name=name)
-
-    async def locate(self) -> Location[float]:
-        """Return the current Z position in µm."""
-        pos: float = await self._worker.run(
-            lambda: self._worker.core.getPosition(self._mm_label)
-        )
-        return Location(setpoint=pos, readback=pos)
-
-    @WatchableAsyncStatus.wrap
-    async def set(self, value: float):  # type: ignore[override]
-        """Move the Z stage to *value* µm, yielding WatcherUpdates until done."""
-        loop = asyncio.get_running_loop()
-        wakeup = asyncio.Event()
-        self._z_wakeup = wakeup
-        self._z_stopped = False
-        self._z_set_success = True
-
-        initial: float = await self._worker.run(
-            lambda: self._worker.core.getPosition(self._mm_label)
-        )
-        current_pos = initial
-
-        def _on_pos_changed(label: str, pos: float) -> None:
-            nonlocal current_pos
-            if label == self._mm_label:
-                current_pos = pos
-                loop.call_soon_threadsafe(wakeup.set)
-
-        self._worker.core.events.stagePositionChanged.connect(_on_pos_changed)
-        await self._worker.run(
-            lambda: self._worker.core.setPosition(self._mm_label, value)
-        )
-
-        try:
-            while True:
-                wakeup.clear()
-                busy: bool = await self._worker.run(
-                    lambda: self._worker.core.deviceBusy(self._mm_label)
-                )
-                yield WatcherUpdate(
-                    current=current_pos,
-                    initial=initial,
-                    target=value,
-                    name=self.name,
-                    unit="µm",
-                )
-                if not busy or self._z_stopped:
-                    break
-                try:
-                    await asyncio.wait_for(wakeup.wait(), timeout=0.1)
-                except asyncio.TimeoutError:
-                    pass
-        finally:
-            self._worker.core.events.stagePositionChanged.disconnect(_on_pos_changed)
-            self._z_wakeup = None
-
-        if not self._z_set_success:
-            raise RuntimeError(f"{self.name}: move was stopped")
-
-    async def stop(self, success: bool = True) -> None:
-        """Stop the Z stage immediately."""
-        self._z_set_success = success
-        self._z_stopped = True
-        await self._worker.run(lambda: self._worker.core.stop(self._mm_label))
-        if self._z_wakeup is not None:
-            self._z_wakeup.set()
-
-
-# ---------------------------------------------------------------------------
-# XY stage
-# ---------------------------------------------------------------------------
-
-XYPosition = tuple[float, float]
-
-
-class MMXYStage(MMDevice):
-    """Micro-Manager XY stage.
-
-    ``x`` and ``y`` are readable/writable signals for the individual axes in µm.
-    For coordinated moves with progress tracking use :meth:`set` instead.
-
-    Parameters
-    ----------
-    mm_label:
-        Micro-Manager device label (e.g. ``"XYStage"``).
-    core:
-        The shared ``CMMCorePlus`` instance.
-    name:
-        ophyd-async device name.
-    """
-
-    x: A[SignalRW[float], XPositionMethod, Format.HINTED_SIGNAL]
-    y: A[SignalRW[float], YPositionMethod, Format.HINTED_SIGNAL]
-
-    def __init__(self, mm_label: str, core: CMMCorePlus, name: str = "") -> None:
-        self._xy_wakeup: asyncio.Event | None = None
-        self._xy_stopped = False
-        self._xy_set_success = True
-        super().__init__(mm_label, core, name=name)
-
-    async def locate(self) -> Location[XYPosition]:
-        """Return the current (x, y) position in µm."""
-
-        def _get_xy() -> XYPosition:
-            core = self._worker.core
-            return core.getXPosition(self._mm_label), core.getYPosition(self._mm_label)
-
-        x, y = await self._worker.run(_get_xy)
-        return Location(setpoint=(x, y), readback=(x, y))
-
-    @WatchableAsyncStatus.wrap
-    async def set(self, value: XYPosition):  # type: ignore[override]
-        """Move the XY stage to *(x, y)* µm, yielding WatcherUpdates until done."""
-        loop = asyncio.get_running_loop()
-        wakeup = asyncio.Event()
-        self._xy_wakeup = wakeup
-        self._xy_stopped = False
-        self._xy_set_success = True
-        target_x, target_y = value
-
-        def _get_xy() -> XYPosition:
-            core = self._worker.core
-            return core.getXPosition(self._mm_label), core.getYPosition(self._mm_label)
-
-        initial: XYPosition = await self._worker.run(_get_xy)
-        current_pos: XYPosition = initial
-
-        def _on_xy_changed(label: str, x: float, y: float) -> None:
-            nonlocal current_pos
-            if label == self._mm_label:
-                current_pos = (x, y)
-                loop.call_soon_threadsafe(wakeup.set)
-
-        self._worker.core.events.XYStagePositionChanged.connect(_on_xy_changed)
-        await self._worker.run(
-            lambda: self._worker.core.setXYPosition(self._mm_label, target_x, target_y)
-        )
-
-        try:
-            while True:
-                wakeup.clear()
-                busy: bool = await self._worker.run(
-                    lambda: self._worker.core.deviceBusy(self._mm_label)
-                )
-                yield WatcherUpdate(
-                    current=current_pos,
-                    initial=initial,
-                    target=value,
-                    name=self.name,
-                    unit="µm",
-                )
-                if not busy or self._xy_stopped:
-                    break
-                try:
-                    await asyncio.wait_for(wakeup.wait(), timeout=0.1)
-                except asyncio.TimeoutError:
-                    pass
-        finally:
-            self._worker.core.events.XYStagePositionChanged.disconnect(_on_xy_changed)
-            self._xy_wakeup = None
-
-        if not self._xy_set_success:
-            raise RuntimeError(f"{self.name}: move was stopped")
-
-    async def stop(self, success: bool = True) -> None:
-        """Stop the XY stage immediately."""
-        self._xy_set_success = success
-        self._xy_stopped = True
-        await self._worker.run(lambda: self._worker.core.stop(self._mm_label))
-        if self._xy_wakeup is not None:
-            self._xy_wakeup.set()

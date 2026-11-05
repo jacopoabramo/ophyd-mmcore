@@ -1,262 +1,192 @@
-from __future__ import annotations
-
 import asyncio
+import logging
 import time
-from typing import TYPE_CHECKING, Any, cast
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from typing import Any, Generic, TypeVar
 
-from ophyd_async.core import SignalBackend, make_datakey
-from ophyd_async.core._signal_backend import Primitive, PrimitiveT, make_metadata
+from bluesky.protocols import Reading
+from event_model import DataKey
+from ophyd_async.core import (
+    NO_ARG_VOID_SIGNATURE,
+    Callback,
+    CommandBackend,
+    SignalBackend,
+    SignalDatatypeT,
+    SignalMetadata,
+    StrictEnum,
+    make_datakey,
+)
 
-if TYPE_CHECKING:
-    from collections.abc import Callable
-    from concurrent.futures import Future
+T = TypeVar("T")
 
-    from bluesky.protocols import Reading
-    from event_model import DataKey
-    from ophyd_async.core import Callback
-    from pymmcore_plus import CMMCorePlus
-
-    from ._worker import MMCoreWorker
+logger = logging.getLogger(__name__)
 
 
-class MMPropertyBackend(SignalBackend[PrimitiveT]):
-    """ophyd-async ``SignalBackend`` for a single Micro-Manager device property.
+class CameraState(StrictEnum):
+    """What a camera is doing, or that writing a frame failed."""
 
-    Micro-Manager properties are always one of ``str``, ``float``, or ``int``
-    (i.e. :data:`~ophyd_async.core.Primitive`), so this backend is typed over
-    ``PrimitiveT`` rather than the full ``SignalDatatypeT``.
+    IDLE = "idle"
+    ACQUIRING = "acquiring"
+    CAPTURING = "capturing"
+    FAULTED = "faulted"
 
-    Parameters
-    ----------
-    device_label:
-        The MM device label (e.g. ``"Camera"``).
-    property_name:
-        The MM property name (e.g. ``"Exposure"``).
-    worker:
-        The shared ``MMCoreWorker``.  Inject one instance per application so
-        that all backends serialise through the same thread.
-    datatype:
-        The Python type for signal values.  Inferred from ``PropertyType`` if
-        not given (falls back to ``str`` for undefined properties).
+
+@dataclass(frozen=True)
+class MMSource(Generic[T]):
+    """How a signal reads, writes and monitors one value of the core.
+
+    `subscribe` takes a callback that receives each new value and the time it
+    arrived, and returns the function that cancels the subscription.
+    """
+
+    uri: str
+    read: Callable[[], Awaitable[T]]
+    write: Callable[[T], Awaitable[None]] | None = None
+    setpoint: Callable[[], Awaitable[T]] | None = None
+    subscribe: Callable[[Callable[[T, float], None]], Callable[[], None]] | None = None
+    infer: Callable[[], Awaitable[type[T]]] | None = None
+    metadata: Callable[[], Awaitable[SignalMetadata]] | None = None
+
+
+class MMSignalBackend(SignalBackend[SignalDatatypeT]):
+    """Signal backend that reads and writes through an [`MMSource`][ophyd_mmcore._backend.MMSource].
+
+    The backend can be created empty and bound later with `bind`. Connecting
+    an unbound backend raises `RuntimeError`.
     """
 
     def __init__(
         self,
-        label: str,
-        property_name: str,
-        worker: MMCoreWorker,
-        datatype: type[PrimitiveT] | None = None,
+        datatype: type[SignalDatatypeT] | None,
+        source: MMSource[SignalDatatypeT] | None = None,
     ) -> None:
-        self._dev = label
-        self._prop = property_name
-        self._worker = worker
-
-        if datatype is None:
-            pt = worker.core.getPropertyType(label, property_name)
-            # to_python() returns str | float | int | None; fall back to str
-            inferred: type[Primitive] = pt.to_python() or str
-            datatype = cast("type[PrimitiveT]", inferred)
-
-        self._reading_callback: Callback[Reading[PrimitiveT]] | None = None
-        # The psygnal slot we connected (kept so we can disconnect it later)
-        self._psygnal_slot: Callable[..., None] | None = None
-        # We need the event loop when wiring callbacks; captured on connect()
-        self._loop: asyncio.AbstractEventLoop | None = None
-
-        self._getter: Callable[[CMMCorePlus, str], Any] | None = None
-        self._setter: Callable[[CMMCorePlus, str, Any], None] | None = None
-        self._event_prop: str = self._prop
-        self._event_factory: Callable[[CMMCorePlus], Any] | None = None
-        self._event_value: Callable[..., Any] | None = None
-
         super().__init__(datatype)
+        self._source = source
+        self._name = ""
+        self._unsubscribe: Callable[[], None] | None = None
+        self._initial: asyncio.Task[None] | None = None
 
-    def configure_prop(self, name: str) -> None:
-        """Configure the backend to use the generic property API for *name*."""
-        self._prop = name
-        self._event_prop = name
+    def bind(self, source: MMSource[Any]) -> None:
+        """Set the source the backend reads and writes."""
+        self._source = source
 
-    def configure_core_method(
-        self,
-        getter: Callable[[CMMCorePlus, str], Any],
-        setter: Callable[[CMMCorePlus, str, Any], None] | None,
-        event_factory: Callable[[CMMCorePlus], Any] | None,
-        event_value: Callable[..., Any] | None = None,
-    ) -> None:
-        """Configure the backend to use dedicated core API methods."""
-        self._getter = getter
-        self._setter = setter
-        self._event_factory = event_factory
-        self._event_value = event_value
+    def _bound(self) -> MMSource[SignalDatatypeT]:
+        if self._source is None:
+            raise RuntimeError(f"Signal {self._name!r} is not bound to a source")
+        return self._source
 
     def source(self, name: str, read: bool) -> str:
-        """Return the source URI for this signal."""
-        return f"mmcore://{self._dev}/{self._prop}"
+        self._name = name
+        return f"mmcore://unbound/{name}" if self._source is None else self._source.uri
 
     async def connect(self, timeout: float) -> None:
-        """Connect to the device property, verifying it is reachable."""
-        self._loop = asyncio.get_running_loop()
-        if (getter := self._getter) is not None:
-            await self._worker.run(lambda: getter(self._worker.core, self._dev))
-        else:
-            await self._worker.run(
-                lambda: self._worker.core.getProperty(self._dev, self._prop)
-            )
+        source = self._bound()
+        if self.datatype is None:
+            if source.infer is None:
+                raise RuntimeError(f"{source.uri} has no datatype and cannot infer one")
+            self.datatype = await source.infer()
+        await self.get_value()
 
-    async def put(self, value: PrimitiveT | None) -> None:
-        """Write *value* to the MM property."""
-        if (setter := self._setter) is not None:
-            await self._worker.run(lambda: setter(self._worker.core, self._dev, value))
-        else:
-            await self._worker.run(
-                lambda: self._worker.core.setProperty(
-                    self._dev, self._prop, cast("Primitive", value)
-                )
-            )
+    def _convert(self, value: Any) -> Any:
+        datatype: Any = self.datatype
+        if not isinstance(datatype, type) or isinstance(value, datatype):
+            return value
+        if datatype is bool and isinstance(value, str):
+            return value.strip().lower() in ("1", "true")
+        return datatype(value)
 
-    async def get_value(self) -> PrimitiveT:
-        """Return the current property value cast to the declared datatype."""
-        assert self.datatype is not None
-        if (getter := self._getter) is not None:
-            raw = await self._worker.run(lambda: getter(self._worker.core, self._dev))
-            return cast("PrimitiveT", self.datatype(raw))
-        raw_str: str = await self._worker.run(
-            lambda: self._worker.core.getProperty(self._dev, self._prop)
-        )
-        return cast("PrimitiveT", self.datatype(raw_str))
-
-    async def get_setpoint(self) -> PrimitiveT:
-        """Return the setpoint (same as readback for MM properties)."""
-        return await self.get_value()
-
-    async def get_reading(self) -> Reading[PrimitiveT]:
-        """Return a Bluesky Reading with the current value and timestamp."""
-        value = await self.get_value()
-        return {
-            "value": value,
-            "timestamp": time.time(),
-            "alarm_severity": 0,
-        }
+    async def put(self, value: SignalDatatypeT | None) -> None:
+        source = self._bound()
+        if source.write is None:
+            raise RuntimeError(f"{source.uri} is read-only")
+        if value is None:
+            raise RuntimeError(f"{source.uri} has no default value to write")
+        await source.write(value)
 
     async def get_datakey(self, source: str) -> DataKey:
-        """Return event-model DataKey metadata for this signal."""
-        assert self.datatype is not None
-        dev, prop = self._dev, self._prop
+        bound = self._bound()
+        metadata = (
+            SignalMetadata() if bound.metadata is None else await bound.metadata()
+        )
+        value = await self.get_value()
+        return make_datakey(self.datatype or type(value), value, source, metadata)
 
-        def _read_all() -> tuple[str, bool, float, float, tuple[str, ...]]:
-            core = self._worker.core
-            raw = core.getProperty(dev, prop)
-            has_limits = core.hasPropertyLimits(dev, prop)
-            lo = core.getPropertyLowerLimit(dev, prop) if has_limits else 0.0
-            hi = core.getPropertyUpperLimit(dev, prop) if has_limits else 0.0
-            allowed = core.getAllowedPropertyValues(dev, prop)
-            return raw, has_limits, lo, hi, allowed
+    async def get_reading(self) -> Reading[SignalDatatypeT]:
+        return Reading(
+            value=await self.get_value(), timestamp=time.time(), alarm_severity=0
+        )
 
-        raw, has_limits, lo, hi, allowed = await self._worker.run(_read_all)
+    async def get_value(self) -> SignalDatatypeT:
+        return self._convert(await self._bound().read())
 
-        value = cast("PrimitiveT", self.datatype(raw))
-        metadata = make_metadata(self.datatype)
+    async def get_setpoint(self) -> SignalDatatypeT:
+        source = self._bound()
+        if source.setpoint is None:
+            return await self.get_value()
+        return self._convert(await source.setpoint())
 
-        if has_limits:
-            from event_model import Limits, LimitsRange
-
-            metadata["limits"] = Limits(
-                control=LimitsRange(low=lo, high=hi),
-                display=LimitsRange(low=lo, high=hi),
-            )
-
-        if allowed:
-            metadata["choices"] = list(allowed)
-
-        return make_datakey(self.datatype, value, source, metadata)
-
-    def set_callback(self, callback: Callback[Reading[PrimitiveT]] | None) -> None:
-        """Wire or unwire the per-property psygnal change signal.
-
-        The psygnal slot fires on the worker thread; the Reading is delivered
-        back to the asyncio loop via ``call_soon_threadsafe``.
-        """
-        core = self._worker.core
-
-        # Always disconnect the existing slot first
-        if self._psygnal_slot is not None:
-            if self._event_factory is not None:
-                self._event_factory(core).disconnect(self._psygnal_slot)
-            elif self._event_prop:
-                core.events.devicePropertyChanged(
-                    self._dev, self._event_prop
-                ).disconnect(self._psygnal_slot)
-            self._psygnal_slot = None
-        self._reading_callback = None
-
+    def set_callback(self, callback: Callback[Reading[SignalDatatypeT]] | None) -> None:
         if callback is None:
+            self._stop()
             return
+        if self._unsubscribe is not None:
+            raise RuntimeError("Cannot set a callback when one is already set")
+        source = self._bound()
+        event_seen = False
 
-        loop = self._loop
-        if loop is None:
-            raise RuntimeError(
-                "set_callback() called before connect(); "
-                "the event loop has not been captured yet."
-            )
-
-        datatype = self.datatype
-        assert datatype is not None
-        label = self._dev
-
-        if self._event_factory is not None:
-            # CoreMethod path: signal emits (label, *args) — filter by label,
-            # then extract the value via event_value (if given) or first arg.
-            event_value_fn = self._event_value
-
-            def _on_method_event(event_label: str, *args: Any) -> None:
-                if event_label != label:
-                    return
-                raw = event_value_fn(*args) if event_value_fn is not None else args[0]
-                reading: Reading[PrimitiveT] = {
-                    "value": cast("PrimitiveT", datatype(raw)),
-                    "timestamp": time.time(),
-                    "alarm_severity": 0,
-                }
-                loop.call_soon_threadsafe(cast("Any", callback), reading)
-
-            self._event_factory(core).connect(_on_method_event)
-            self._psygnal_slot = _on_method_event
-        elif self._event_prop:
-            # PropName path: devicePropertyChanged emits (device, prop, value)
-            def _on_property_changed(new_value: str) -> None:
-                reading = {
-                    "value": cast("PrimitiveT", datatype(new_value)),
-                    "timestamp": time.time(),
-                    "alarm_severity": 0,
-                }
-                loop.call_soon_threadsafe(cast("Any", callback), reading)
-
-            core.events.devicePropertyChanged(self._dev, self._event_prop).connect(
-                _on_property_changed
-            )
-            self._psygnal_slot = _on_property_changed
-
-        self._reading_callback = callback
-
-        getter = self._getter
-
-        def _deliver_initial() -> None:
-            if getter is not None:
-                raw = getter(core, self._dev)
-                value = cast("PrimitiveT", datatype(raw))
-            else:
-                value = cast(
-                    "PrimitiveT", datatype(core.getProperty(self._dev, self._prop))
+        def deliver(value: Any, timestamp: float) -> None:
+            nonlocal event_seen
+            event_seen = True
+            callback(
+                Reading(
+                    value=self._convert(value), timestamp=timestamp, alarm_severity=0
                 )
-            loop.call_soon_threadsafe(
-                cast("Any", callback),
-                {"value": value, "timestamp": time.time(), "alarm_severity": 0},
             )
 
-        # Immediately deliver the current value so the subscriber is
-        # synchronised on registration (matches SoftSignalBackend behaviour)
-        self.submit(_deliver_initial)
+        async def deliver_current() -> None:
+            try:
+                value = await source.read()
+            except Exception:
+                logger.exception("Initial read of %s failed", source.uri)
+                return
+            if not event_seen:
+                deliver(value, time.time())
 
-    def submit(self, fn: Callable[[], Any]) -> Future[Any]:
-        """Direct access to the worker queue (for subclasses or tests)."""
-        return self._worker.submit(fn)
+        subscribe = source.subscribe or (lambda _: lambda: None)
+        self._unsubscribe = subscribe(deliver)
+        self._initial = asyncio.get_running_loop().create_task(deliver_current())
+
+    def _stop(self) -> None:
+        if self._initial is not None:
+            self._initial.cancel()
+            self._initial = None
+        if self._unsubscribe is not None:
+            self._unsubscribe()
+            self._unsubscribe = None
+
+
+class MMCommandBackend(CommandBackend[[], None]):
+    """Command backend that runs a bound call with no arguments."""
+
+    def __init__(self) -> None:
+        super().__init__(NO_ARG_VOID_SIGNATURE)
+        self._execute: Callable[[], Awaitable[None]] | None = None
+        self._uri: str | None = None
+
+    def bind(self, execute: Callable[[], Awaitable[None]], uri: str) -> None:
+        """Set the call the command runs and its source."""
+        self._execute = execute
+        self._uri = uri
+
+    def source(self, name: str) -> str:
+        return f"mmcore://unbound/{name}" if self._uri is None else self._uri
+
+    async def connect(self, timeout: float) -> None:
+        if self._execute is None:
+            raise RuntimeError("Command backend is not bound to a call")
+
+    async def execute(self) -> None:
+        if self._execute is None:
+            raise RuntimeError("Command backend is not bound to a call")
+        await self._execute()
