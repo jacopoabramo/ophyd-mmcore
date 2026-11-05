@@ -148,8 +148,9 @@ class CameraIO:
     capturing with it. An output's store cannot be replaced while the camera captures, and clearing
     its `file_path` then closes the gate before the store.
 
-    A frame that cannot be written stops the sequence and faults the camera
-    with the error as `last_error`, until `acquire` is set to true again.
+    A frame that cannot be written, or frames lost because the core's
+    circular buffer overflowed, stop the sequence and fault the camera with
+    the error as `last_error`, until `acquire` is set to true again.
     """
 
     def __init__(
@@ -273,7 +274,7 @@ class CameraIO:
         output = self._outputs.get(physical)
         if output is None:
             return False
-        failed = False
+        error = ""
         with self._lock:
             limit = self._values["num_capture"]
             if (
@@ -284,13 +285,8 @@ class CameraIO:
                 return True
             try:
                 output.store.append(frame)
-            except Exception as error:
-                failed = True
-                self._faulted = True
-                self._update(
-                    capture=False,
-                    last_error=f"Cannot write a frame of camera {physical!r}: {error}",
-                )
+            except Exception as exception:
+                error = f"Cannot write a frame of camera {physical!r}: {exception}"
             else:
                 output.written += 1
                 output.captured += 1
@@ -299,9 +295,16 @@ class CameraIO:
                 )
                 if limit and all(o.written >= limit for o in self._outputs.values()):
                     self._update(capture=False)
-        if failed:
-            self._ctrl.core.stopSequenceAcquisition(self.label)
+        if error:
+            self.fault(error)
         return True
+
+    def fault(self, error: str) -> None:
+        """Close the gate, stop the sequence and fault the camera with `error`."""
+        with self._lock:
+            self._faulted = True
+            self._update(capture=False, last_error=error)
+        self._ctrl.core.stopSequenceAcquisition(self.label)
 
     def close(self) -> None:
         """Close the gate and every store, and clear `acquire`."""

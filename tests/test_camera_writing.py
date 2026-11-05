@@ -307,3 +307,14 @@ async def test_write_error_faults_the_camera(
     assert await cam_signals.state.get_value() == CameraState.FAULTED
     assert "disk full" in await cam_signals.last_error.get_value()
     await wait_until(lambda: not uni_core.isSequenceRunning("Cam"))
+
+
+async def test_buffer_overflow_faults_the_camera(cam_signals, uni_core, monkeypatch):
+    """Fault the camera and stop its sequence when the circular buffer overflows."""
+    overflowed = threading.Event()
+    monkeypatch.setattr(uni_core, "isBufferOverflowed", overflowed.is_set)
+    await cam_signals.acquire.set(True)
+    overflowed.set()
+    await wait_for_value(cam_signals.state, CameraState.FAULTED, timeout=5)
+    assert "overflowed" in await cam_signals.last_error.get_value()
+    await wait_until(lambda: not uni_core.isSequenceRunning("Cam"))

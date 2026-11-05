@@ -66,7 +66,7 @@ class MMController:
         self._cameras: dict[str, CameraIO] = {}
         self._acquiring: str | None = None
         self._restore: tuple[str, bool] | None = None
-        self._router = FrameRouter(core, self._deliver)
+        self._router = FrameRouter(core, self._deliver, self._on_overflow)
         self._dropped: set[str] = set()
         events = core.events
         self._connections: list[tuple[Any, Callable[..., None]]] = [
@@ -479,6 +479,13 @@ class MMController:
         if not delivered and physical not in self._dropped:
             self._dropped.add(physical)
             logger.warning("Dropping the frames of %r, which has no output", physical)
+
+    def _on_overflow(self) -> None:
+        if (camera := self._cameras.get(self._acquiring or "")) is not None:
+            camera.fault(
+                f"Frames of camera {camera.label!r} were lost because the "
+                "circular buffer overflowed"
+            )
 
     def close(self) -> None:
         """Stop the acquiring camera, close every store and drop every subscription.

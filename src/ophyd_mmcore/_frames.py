@@ -14,15 +14,20 @@ class FrameRouter:
 
     Each frame goes to `deliver` with the label of the physical camera that
     sent it, read from the frame's `Camera` metadata tag. When the buffer is
-    empty the thread sleeps for 1 ms. An error while popping or delivering a
-    frame is logged and the thread goes on.
+    empty the thread sleeps for 1 ms. The first time the buffer has
+    overflowed since the thread started, `overflow` is called. An error while
+    popping or delivering a frame is logged and the thread goes on.
     """
 
     def __init__(
-        self, core: CMMCorePlus, deliver: Callable[[str, np.ndarray], None]
+        self,
+        core: CMMCorePlus,
+        deliver: Callable[[str, np.ndarray], None],
+        overflow: Callable[[], None],
     ) -> None:
         self._core = core
         self._deliver = deliver
+        self._overflow = overflow
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
 
@@ -45,8 +50,12 @@ class FrameRouter:
         self._thread = None
 
     def _run(self) -> None:
+        overflowed = False
         while not self._stop.is_set():
             try:
+                if not overflowed and self._core.isBufferOverflowed():
+                    overflowed = True
+                    self._overflow()
                 if self._core.getRemainingImageCount() == 0:
                     time.sleep(0.001)
                     continue
