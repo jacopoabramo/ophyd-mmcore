@@ -376,10 +376,16 @@ class MMController:
         )
 
     def halt(self, label: str) -> Callable[[], Awaitable[None]]:
-        """Return the call that stops the device `label`."""
+        """Return the call that stops the device `label`.
+
+        The targets written to the device are dropped, so the next setpoint
+        read and the next move of another XY axis start from the hardware.
+        """
 
         async def run() -> None:
             await self.call(self._core.stop, label)
+            for key in [key for key in self._targets if key[0] == label]:
+                del self._targets[key]
 
         return run
 

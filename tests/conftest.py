@@ -122,29 +122,42 @@ class FakeStage(StageDevice):
 
 
 class FakeXYStage(XYStageDevice):
-    """XY stage that moves instantly."""
+    """XY stage that stays busy for 200 ms per move and reaches its target at the end.
+
+    Stopping a move leaves the stage where it started.
+    """
 
     def __init__(self) -> None:
         super().__init__()
         self._position = (0.0, 0.0)
+        self._target = (0.0, 0.0)
+        self._busy_until = 0.0
 
     def set_position_um(self, x: float, y: float) -> None:
-        self._position = (x, y)
+        self._position = self.get_position_um()
+        self._target = (x, y)
+        self._busy_until = time.monotonic() + 0.2
 
     def get_position_um(self) -> tuple[float, float]:
+        if not self.busy():
+            self._position = self._target
         return self._position
 
+    def busy(self) -> bool:
+        return time.monotonic() < self._busy_until
+
     def home(self) -> None:
-        self._position = (0.0, 0.0)
+        self._position = self._target = (0.0, 0.0)
 
     def stop(self) -> None:
-        pass
+        self._target = self.get_position_um()
+        self._busy_until = 0.0
 
     def set_origin_x(self) -> None:
-        self._position = (0.0, self._position[1])
+        self._position = self._target = (0.0, self.get_position_um()[1])
 
     def set_origin_y(self) -> None:
-        self._position = (self._position[0], 0.0)
+        self._position = self._target = (self.get_position_um()[0], 0.0)
 
 
 class FakeShutter(ShutterDevice):

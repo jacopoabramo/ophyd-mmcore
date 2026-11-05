@@ -1,4 +1,5 @@
 import asyncio
+import threading
 
 import pytest
 from ophyd_async.core import init_devices
@@ -60,6 +61,31 @@ async def test_stop_fails_the_move(ctrl):
     await z.stop()
     with pytest.raises(RuntimeError, match="stopped"):
         await status
+
+
+async def test_halt_leaves_the_other_xy_axis_where_it_stopped(
+    ctrl, uni_core, monkeypatch
+):
+    """Keep a halted y axis where it stopped when x moves next."""
+    async with init_devices():
+        xy = MMXYStage("XY", ctrl)
+    started = threading.Event()
+    set_xy_position = uni_core.setXYPosition
+
+    def signalling_set_xy_position(*args) -> None:
+        set_xy_position(*args)
+        started.set()
+
+    monkeypatch.setattr(uni_core, "setXYPosition", signalling_set_xy_position)
+    status = xy.y.set(100.0)
+    await asyncio.to_thread(started.wait, 5)
+    await xy.y.stop()
+    with pytest.raises(RuntimeError, match="stopped"):
+        await status
+    assert uni_core.getYPosition("XY") == 0.0
+    await xy.x.set(5.0)
+    assert tuple(uni_core.getXYPosition("XY")) == (5.0, 0.0)
+    assert (await xy.y.locate())["setpoint"] == 0.0
 
 
 async def test_mock_stage_moves_instantly(bare_ctrl):
