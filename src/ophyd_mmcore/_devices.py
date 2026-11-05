@@ -8,7 +8,6 @@ from bluesky.protocols import Location
 from ophyd_async.core import (
     DeviceMap,
     MovableLogic,
-    PathProvider,
     SignalDatatypeT,
     SignalRW,
     StandardMovable,
@@ -92,25 +91,6 @@ class MMDevice(StandardReadable):
     def label(self) -> str:
         """The Micro-Manager label of the device."""
         return self._label
-
-
-class MMSystem(StandardReadable):
-    """A microscope declared as a class, whose children are marked with [`Label`][ophyd_mmcore.Label]."""
-
-    def __init__(
-        self,
-        core: "CMMCorePlus",
-        *,
-        path_provider: PathProvider | None = None,
-        move_timeout: float | None = 10.0,
-        name: str = "",
-    ) -> None:
-        super().__init__(
-            name=name,
-            connector=MMConnector(
-                core, path_provider=path_provider, move_timeout=move_timeout
-            ),
-        )
 
 
 @dataclass

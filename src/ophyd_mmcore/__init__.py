@@ -11,9 +11,9 @@ from ._devices import (
     MMDevice,
     MMShutter,
     MMStateDevice,
-    MMSystem,
 )
 from ._stage import MMAxis, MMXYStage, MMZStage
+from ._system import MMSystem
 
 __version__ = version("ophyd-mmcore")
 

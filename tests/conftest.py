@@ -2,11 +2,13 @@
 
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from pathlib import Path
 from typing import Annotated as A
 
 import numpy as np
 import pytest
 from numpy.typing import DTypeLike
+from ophyd_async.core import StaticPathProvider, UUIDFilenameProvider
 from pymmcore_plus import CMMCorePlus
 from pymmcore_plus.experimental.unicore import (
     ShutterDevice,
@@ -19,6 +21,11 @@ from pymmcore_plus.experimental.unicore import (
 )
 
 from ophyd_mmcore import Label, MMDevice, MMSystem
+
+
+def provider(path: Path) -> StaticPathProvider:
+    """Return a path provider that gives each data key a unique file under `path`."""
+    return StaticPathProvider(UUIDFilenameProvider(), path)
 
 
 class FakeCamera(SimpleCameraDevice):
