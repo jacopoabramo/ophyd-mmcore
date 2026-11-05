@@ -104,7 +104,6 @@ class FakeStage(StageDevice):
             raise ValueError(f"{val} um is outside the stage limits")
         self._target = val
         self._busy_until = time.monotonic() + 0.05
-        self.core.events.stagePositionChanged.emit(self.get_label(), val)
 
     def get_position_um(self) -> float:
         return self._target
@@ -131,7 +130,6 @@ class FakeXYStage(XYStageDevice):
 
     def set_position_um(self, x: float, y: float) -> None:
         self._position = (x, y)
-        self.core.events.XYStagePositionChanged.emit(self.get_label(), x, y)
 
     def get_position_um(self) -> tuple[float, float]:
         return self._position

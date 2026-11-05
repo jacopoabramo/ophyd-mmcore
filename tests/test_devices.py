@@ -216,21 +216,21 @@ async def test_system_moves_declared_devices(ctrl):
         (
             lambda ctrl: MMZStage("Z", ctrl),
             lambda d: d.position,
-            lambda core: core.setPosition("Z", 4.0),
+            lambda core: core.events.stagePositionChanged.emit("Z", 4.0),
             0.0,
             4.0,
         ),
         (
             lambda ctrl: MMXYStage("XY", ctrl),
             lambda d: d.x.position,
-            lambda core: core.setXYPosition("XY", 1.0, 2.0),
+            lambda core: core.events.XYStagePositionChanged.emit("XY", 1.0, 2.0),
             0.0,
             1.0,
         ),
         (
             lambda ctrl: MMXYStage("XY", ctrl),
             lambda d: d.y.position,
-            lambda core: core.setXYPosition("XY", 1.0, 2.0),
+            lambda core: core.events.XYStagePositionChanged.emit("XY", 1.0, 2.0),
             0.0,
             2.0,
         ),
@@ -268,7 +268,7 @@ async def test_system_moves_declared_devices(ctrl):
 async def test_change_on_the_core_reaches_the_position_signal(
     ctrl, uni_core, build, signal, change, initial, expected
 ):
-    """Deliver a change made on the core to a subscriber of the position signal."""
+    """Deliver a change the core reports to a subscriber of the position signal."""
     async with init_devices():
         device = build(ctrl)
     with MonitorQueue(signal(device)) as queue:

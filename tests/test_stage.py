@@ -16,6 +16,21 @@ async def test_z_move_waits_for_idle(ctrl):
     assert (await z.read()).keys() == {"z"}
 
 
+async def test_staged_read_reports_the_position_after_a_move(ctrl):
+    """Read the new position of a staged Z stage and XY axis after each move."""
+    async with init_devices():
+        z = MMZStage("Z", ctrl)
+        xy = MMXYStage("XY", ctrl)
+    await z.stage()
+    await xy.stage()
+    await z.set(5.0)
+    await xy.x.set(3.0)
+    assert (await z.read())["z"]["value"] == 5.0
+    assert (await xy.read())["xy-x"]["value"] == 3.0
+    await z.unstage()
+    await xy.unstage()
+
+
 async def test_concurrent_xy_axis_moves_both_land(ctrl, uni_core):
     """Move both XY axes at once and land at both targets."""
     async with init_devices():

@@ -229,6 +229,13 @@ class MMController:
                         value, lambda: self._core.setXYPosition(label, x, y)
                     )
             await self.call(self._core.waitForDevice, label)
+            # Most adapters and the core send no position event after a move.
+            if axis == "z":
+                position = await self.call(self._core.getPosition, label)
+                self._on_stage_position(label, position)
+            else:
+                x, y = await self.call(self._core.getXYPosition, label)
+                self._on_xy_position(label, x, y)
 
         async def metadata() -> SignalMetadata:
             return SignalMetadata(units="um")
