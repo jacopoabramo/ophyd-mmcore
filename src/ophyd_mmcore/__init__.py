@@ -6,11 +6,9 @@ from ._backend import CameraState
 from ._camera import MMCamera, MMCameraOutput
 from ._config import make_config_groups, make_devices
 from ._connector import Label, Property
-from ._controller import MMController
 from ._devices import (
     MMConfigGroup,
     MMDevice,
-    MMMoveLogic,
     MMShutter,
     MMStateDevice,
     MMSystem,
@@ -26,9 +24,7 @@ __all__ = [
     "MMCamera",
     "MMCameraOutput",
     "MMConfigGroup",
-    "MMController",
     "MMDevice",
-    "MMMoveLogic",
     "MMShutter",
     "MMStateDevice",
     "MMSystem",

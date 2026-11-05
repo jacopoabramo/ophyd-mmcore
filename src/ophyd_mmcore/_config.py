@@ -1,24 +1,22 @@
 from ophyd_async.core import Device, PathProvider
-from pymmcore_plus import DeviceType
+from pymmcore_plus import CMMCorePlus, DeviceType
 
 from ._camera import MMCamera
 from ._connector import clean_name
-from ._controller import MMController
 from ._devices import MMConfigGroup, MMDevice, MMShutter, MMStateDevice
 from ._stage import MMXYStage, MMZStage
 
 MULTI_CAMERA_PROPERTIES = tuple(f"Physical Camera {n}" for n in range(1, 5))
 
 
-def physical_cameras(ctrl: MMController, label: str) -> list[str]:
+def physical_cameras(core: CMMCorePlus, label: str) -> list[str]:
     """Return the labels set in the physical camera properties of a Multi Camera."""
-    core = ctrl.core
     values = (core.getProperty(label, prop) for prop in MULTI_CAMERA_PROPERTIES)
     return [value for value in values if value != "Undefined"]
 
 
 def make_devices(
-    ctrl: MMController,
+    core: CMMCorePlus,
     *,
     path_provider: PathProvider,
     move_timeout: float | None = 10.0,
@@ -42,7 +40,6 @@ def make_devices(
     ValueError
         Two labels clean to the same key.
     """
-    core = ctrl.core
     devices: dict[str, Device] = {}
     labels: dict[str, str] = {}
     for label in core.getLoadedDevices():
@@ -50,28 +47,28 @@ def make_devices(
         match core.getDeviceType(label):
             case DeviceType.Camera:
                 physical = (
-                    physical_cameras(ctrl, label)
+                    physical_cameras(core, label)
                     if core.getDeviceLibrary(label) == "Utilities"
                     and core.getDeviceName(label) == "Multi Camera"
                     else []
                 )
                 device = MMCamera(
                     label,
-                    ctrl,
+                    core,
                     path_provider=path_provider,
                     physical=physical,
                     name=key,
                 )
             case DeviceType.Stage:
-                device = MMZStage(label, ctrl, move_timeout=move_timeout, name=key)
+                device = MMZStage(label, core, move_timeout=move_timeout, name=key)
             case DeviceType.XYStage:
-                device = MMXYStage(label, ctrl, move_timeout=move_timeout, name=key)
+                device = MMXYStage(label, core, move_timeout=move_timeout, name=key)
             case DeviceType.Shutter:
-                device = MMShutter(label, ctrl, move_timeout=move_timeout, name=key)
+                device = MMShutter(label, core, move_timeout=move_timeout, name=key)
             case DeviceType.State:
-                device = MMStateDevice(label, ctrl, move_timeout=move_timeout, name=key)
+                device = MMStateDevice(label, core, move_timeout=move_timeout, name=key)
             case DeviceType.Generic:
-                device = MMDevice(label, ctrl, name=key)
+                device = MMDevice(label, core, name=key)
             case _:
                 continue
         if key in devices:
@@ -84,7 +81,7 @@ def make_devices(
 
 
 def make_config_groups(
-    ctrl: MMController, *, move_timeout: float | None = 10.0
+    core: CMMCorePlus, *, move_timeout: float | None = 10.0
 ) -> dict[str, MMConfigGroup]:
     """Build an `MMConfigGroup` for each configuration group of the core.
 
@@ -99,14 +96,14 @@ def make_config_groups(
     """
     groups: dict[str, MMConfigGroup] = {}
     names: dict[str, str] = {}
-    for group in ctrl.core.getAvailableConfigGroups():
+    for group in core.getAvailableConfigGroups():
         key = clean_name(group)
         if key in groups:
             raise ValueError(
                 f"Group names {names[key]!r} and {group!r} both clean to {key!r}"
             )
         groups[key] = MMConfigGroup(
-            group, ctrl, move_timeout=move_timeout, name=f"{key}_group"
+            group, core, move_timeout=move_timeout, name=f"{key}_group"
         )
         names[key] = group
     return groups

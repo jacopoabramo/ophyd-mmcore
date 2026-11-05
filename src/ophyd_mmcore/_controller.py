@@ -4,7 +4,6 @@ import threading
 import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Literal, ParamSpec, TypeVar
 
 import numpy as np
@@ -50,11 +49,26 @@ class Subscription:
             self.callback(value, timestamp)
 
 
+CONTROLLER_ATTRIBUTE = "_ophyd_mmcore_controller"
+controller_lock = threading.Lock()
+
+
+def controller_for(core: CMMCorePlus) -> "MMController":
+    """Return the controller of `core`, creating it on the first call."""
+    with controller_lock:
+        controller = getattr(core, CONTROLLER_ATTRIBUTE, None)
+        if controller is None:
+            controller = MMController(core)
+            setattr(core, CONTROLLER_ATTRIBUTE, controller)
+    return controller
+
+
 class MMController:
     """The only object that calls the Micro-Manager core on behalf of devices.
 
-    A controller owns its core: two controllers on one core are not
-    supported.
+    A controller owns its core: get it with
+    [`controller_for`][ophyd_mmcore._controller.controller_for], which makes
+    one per core.
     """
 
     def __init__(self, core: CMMCorePlus) -> None:
@@ -84,23 +98,16 @@ class MMController:
         for signal, slot in self._connections:
             signal.connect(slot)
 
-    @classmethod
-    def from_config(
-        cls, path: str | Path, core: CMMCorePlus | None = None
-    ) -> "MMController":
-        """Load a Micro-Manager configuration file into a core and wrap it.
-
-        A new core is created when `core` is not given. The load blocks until
-        the devices are initialised.
-        """
-        core = CMMCorePlus() if core is None else core
-        core.loadSystemConfiguration(path)
-        return cls(core)
-
     @property
     def core(self) -> CMMCorePlus:
         """The Micro-Manager core the controller calls."""
         return self._core
+
+    def is_loaded(self, label: str, group: bool) -> bool:
+        """Return whether the core has loaded the device `label`, or defines the group `label` when `group`."""
+        if group:
+            return label in self._core.getAvailableConfigGroups()
+        return label in self._core.getLoadedDevices()
 
     async def call(self, fn: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
         """Run a core call in a worker thread and return its result."""
@@ -352,7 +359,7 @@ class MMController:
 
         Writing moves to the state with that label and returns when the device
         is idle. The labels of the device are the `choices` of its metadata.
-        `setpoint` behaves as it does for [`shutter_source`][ophyd_mmcore.MMController.shutter_source].
+        `setpoint` behaves as it does for [`shutter_source`][ophyd_mmcore._controller.MMController.shutter_source].
         """
         return self._moving_source(
             f"mmcore://{label}/Label",
@@ -370,7 +377,7 @@ class MMController:
         Writing applies the preset and returns when every device it touches is
         idle. Reading gives `""` when no preset matches the hardware. The
         presets of the group are the `choices` of its metadata. `setpoint`
-        behaves as it does for [`shutter_source`][ophyd_mmcore.MMController.shutter_source].
+        behaves as it does for [`shutter_source`][ophyd_mmcore._controller.MMController.shutter_source].
         """
         return self._moving_source(
             f"mmcore://{group}/preset",

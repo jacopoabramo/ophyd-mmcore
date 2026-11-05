@@ -1,22 +1,26 @@
 import re
 import types
 import typing
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Annotated, Any, Literal, Union, get_args, get_origin
+from typing import TYPE_CHECKING, Annotated, Any, Literal, Union, get_args, get_origin
 
 from ophyd_async.core import (
     Command,
     Device,
     DeviceConnector,
     DeviceFiller,
+    NotConnectedError,
     PathProvider,
     Signal,
 )
 
-from ._backend import MMCommandBackend, MMSignalBackend
+from ._backend import MMCommandBackend, MMSignalBackend, MMSource
 from ._camera_io import CameraValueName, OutputValueName
-from ._controller import MMController
+from ._controller import MMController, controller_for
+
+if TYPE_CHECKING:
+    from pymmcore_plus import CMMCorePlus
 
 
 @dataclass(frozen=True)
@@ -120,13 +124,16 @@ def take_marker(extras: list[Any]) -> Any:
 class MMConnector(DeviceConnector):
     """Builds the declared children of a device from their markers.
 
-    Holds what a device needs to address the core: the controller, the label
-    and the options of the device.
+    Holds what a device needs to address the core: the core, the label and
+    the options of the device. The signal and command backends it builds are
+    bound to the core's controller at `connect`, after a check that the core
+    has the label: a loaded device, or a configuration group when `group` is
+    true. A connect in mock mode binds nothing and never reaches the core.
     """
 
     def __init__(
         self,
-        ctrl: MMController,
+        core: "CMMCorePlus | None",
         label: str = "",
         *,
         axis: Literal["x", "y"] | None = None,
@@ -136,7 +143,12 @@ class MMConnector(DeviceConnector):
         path_provider: PathProvider | None = None,
         move_timeout: float | None = 10.0,
     ) -> None:
-        self.ctrl = ctrl
+        self.core = core
+        self.group = False
+        self.signal_binds: list[
+            tuple[MMSignalBackend, Callable[[MMController], MMSource[Any]]]
+        ] = []
+        self.halts: list[MMCommandBackend] = []
         self.path_provider = path_provider
         self.move_timeout = move_timeout
         self.set_address(
@@ -166,9 +178,9 @@ class MMConnector(DeviceConnector):
         self.properties = tuple(properties)
 
     def child(self) -> "MMConnector":
-        """Return a connector for a declared child, with the same controller and options."""
+        """Return a connector for a declared child, with the same core and options."""
         return MMConnector(
-            self.ctrl,
+            self.core,
             self.label,
             physical=self.physical,
             path_provider=self.path_provider,
@@ -176,8 +188,62 @@ class MMConnector(DeviceConnector):
         )
 
     def property_backend(self, name: str) -> MMSignalBackend:
-        """Return a bound backend, with no declared datatype, for a property of the label."""
-        return MMSignalBackend(None, self.ctrl.property_source(self.label, name))
+        """Return a backend, with no declared datatype, for a property of the label.
+
+        It is bound when the connector connects.
+        """
+        backend = MMSignalBackend(None)
+        self.signal_binds.append(
+            (backend, lambda ctrl: ctrl.property_source(self.label, name))
+        )
+        return backend
+
+    def signal_source(self, marker: Any) -> Callable[[MMController], MMSource[Any]]:
+        """Return the function that gives the controller's source for a signal marker."""
+        match marker:
+            case Property(name):
+                return lambda ctrl: ctrl.property_source(self.label, name)
+            case Position():
+                return lambda ctrl: ctrl.position_source(self.label, self.axis or "z")
+            case ShutterOpen():
+                return lambda ctrl: ctrl.shutter_source(self.label)
+            case StateLabel():
+                return lambda ctrl: ctrl.state_source(self.label)
+            case Preset():
+                return lambda ctrl: ctrl.preset_source(self.label)
+            case CameraValue(name):
+                return lambda ctrl: ctrl.camera_io(self.label, self.physical).source(
+                    name
+                )
+            case OutputValue(name) if self.output is not None:
+                output = self.output
+                return lambda ctrl: ctrl.camera_io(
+                    self.label, self.physical
+                ).output_source(output, name)
+            case _:
+                raise TypeError(f"{marker!r} does not fit a Signal")
+
+    async def connect_real(
+        self, device: Device, timeout: float, force_reconnect: bool
+    ) -> None:
+        """Check the label, bind every backend to the core's controller and connect the children.
+
+        Raises
+        ------
+        NotConnectedError
+            If the core has no device, or no configuration group, of the label.
+        """
+        if self.core is None:
+            raise NotConnectedError(f"{device.name!r} has no core to connect to")
+        ctrl = controller_for(self.core)
+        if self.label and not await ctrl.call(ctrl.is_loaded, self.label, self.group):
+            kind = "configuration group" if self.group else "device"
+            raise NotConnectedError(f"The core has no {kind} {self.label!r}")
+        for backend, source in self.signal_binds:
+            backend.bind(source(ctrl))
+        for backend in self.halts:
+            backend.bind(ctrl.halt(self.label), f"mmcore://{self.label}/halt")
+        await super().connect_real(device, timeout, force_reconnect)
 
     def check_markers(self, device: Device) -> None:
         """Raise `TypeError` for a declared child whose marker is missing or does not fit."""
@@ -231,39 +297,12 @@ class MMConnector(DeviceConnector):
             command_backend_factory=lambda sig: MMCommandBackend(),
         )
         for backend, extras in self.filler.create_signals_from_annotations():
-            marker = take_marker(extras)
-            match marker:
-                case Property(name):
-                    backend.bind(self.ctrl.property_source(self.label, name))
-                case Position():
-                    backend.bind(
-                        self.ctrl.position_source(self.label, self.axis or "z")
-                    )
-                case ShutterOpen():
-                    backend.bind(self.ctrl.shutter_source(self.label))
-                case StateLabel():
-                    backend.bind(self.ctrl.state_source(self.label))
-                case Preset():
-                    backend.bind(self.ctrl.preset_source(self.label))
-                case CameraValue(name):
-                    backend.bind(
-                        self.ctrl.camera_io(self.label, self.physical).source(name)
-                    )
-                case OutputValue(name) if self.output is not None:
-                    backend.bind(
-                        self.ctrl.camera_io(self.label, self.physical).output_source(
-                            self.output, name
-                        )
-                    )
-                case _:
-                    raise TypeError(f"{marker!r} does not fit a Signal")
+            self.signal_binds.append((backend, self.signal_source(take_marker(extras))))
         for backend, extras in self.filler.create_commands_from_annotations():
             marker = take_marker(extras)
             match marker:
                 case Halt():
-                    backend.bind(
-                        self.ctrl.halt(self.label), f"mmcore://{self.label}/halt"
-                    )
+                    self.halts.append(backend)
                 case _:
                     raise TypeError(f"{marker!r} does not fit a Command")
         for connector, extras in self.filler.create_devices_from_annotations():
