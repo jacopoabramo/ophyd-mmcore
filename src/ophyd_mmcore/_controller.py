@@ -1,7 +1,9 @@
 import asyncio
+import atexit
 import logging
 import threading
 import time
+import weakref
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, ParamSpec, TypeVar
@@ -51,6 +53,7 @@ class Subscription:
 
 CONTROLLER_ATTRIBUTE = "_ophyd_mmcore_controller"
 controller_lock = threading.Lock()
+controllers: weakref.WeakSet["MMController"] = weakref.WeakSet()
 
 
 def controller_for(core: CMMCorePlus) -> "MMController":
@@ -60,7 +63,20 @@ def controller_for(core: CMMCorePlus) -> "MMController":
         if controller is None:
             controller = MMController(core)
             setattr(core, CONTROLLER_ATTRIBUTE, controller)
+            controllers.add(controller)
     return controller
+
+
+def close_controllers() -> None:
+    """Close every live controller, logging a failure instead of raising it."""
+    for controller in list(controllers):
+        try:
+            controller.close()
+        except Exception:
+            logger.exception("Closing a controller at exit failed")
+
+
+atexit.register(close_controllers)
 
 
 class MMController:

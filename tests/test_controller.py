@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import subprocess
+import sys
 import threading
 import time
 from typing import Annotated as A
@@ -129,3 +131,36 @@ async def test_event_timestamp_is_arrival_time(uni_core):
     time.sleep(0.3)
     reading = (await updates.get())[sig.name]
     assert time.time() - reading["timestamp"] > 0.25
+
+
+EXIT_SCRIPT = """
+import atexit
+from pymmcore_plus import CMMCorePlus
+core = CMMCorePlus()
+core.loadSystemConfiguration("MMConfig_demo.cfg")
+# Registered before ophyd_mmcore is imported, so it runs after the package's hook.
+atexit.register(lambda: print(core.isSequenceRunning(), core.getAutoShutter()))
+import asyncio, tempfile
+from ophyd_async.core import StaticPathProvider, UUIDFilenameProvider
+from ophyd_mmcore import MMCamera
+
+async def main():
+    provider = StaticPathProvider(UUIDFilenameProvider(), tempfile.mkdtemp())
+    camera = MMCamera("Camera", core, path_provider=provider, name="camera")
+    await camera.connect()
+    await camera.stage()
+
+asyncio.run(main())
+"""
+
+
+@pytest.mark.demo
+def test_exit_stops_a_staged_camera(demo_core, tmp_path):
+    """Stop the sequence and restore AutoShutter at exit when a camera was never unstaged."""
+    script = tmp_path / "staged.py"
+    script.write_text(EXIT_SCRIPT)
+    result = subprocess.run(
+        [sys.executable, str(script)], capture_output=True, text=True, timeout=60
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split()[-2:] == ["False", "True"]
