@@ -95,12 +95,11 @@ class MMAcquireLogic(DetectorAcquireLogic):
     last_error: SignalR[str]
 
     async def ensure_ready(self) -> None:
-        """Leave the camera idle, as staging starts no sequence."""
+        """Do nothing: the sequence starts at the first acquisition, not at staging."""
 
     async def start_acquiring(self) -> None:
-        """Start the camera's sequence unless it runs, then open the gate to the stores."""
-        if not await self.acquire.get_value():
-            await self.acquire.set(True)
+        """Start the camera's sequence, then open the gate to the stores."""
+        await self.acquire.set(True)
         await self.capture.set(True)
 
     async def wait_for_idle(self) -> None:
