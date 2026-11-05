@@ -34,7 +34,8 @@ def make_devices(
 
     All cameras share `path_provider`, which ophyd-async calls with each data
     key. Use a filename provider that depends on that key: two outputs with the
-    same filename share a store, and the second fails when it is prepared.
+    same filename name the same store, and the second to open it is refused,
+    at the latest when its capture starts.
 
     Raises
     ------

@@ -51,7 +51,11 @@ class Subscription:
 
 
 class MMController:
-    """The only object that calls the Micro-Manager core on behalf of devices."""
+    """The only object that calls the Micro-Manager core on behalf of devices.
+
+    A controller owns its core: two controllers on one core are not
+    supported.
+    """
 
     def __init__(self, core: CMMCorePlus) -> None:
         self._core = core
