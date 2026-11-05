@@ -83,7 +83,7 @@ class MMTriggerLogic(DetectorTriggerLogic):
 
 @dataclass
 class MMAcquireLogic(DetectorAcquireLogic):
-    """Run the camera's sequence from stage to unstage and open the gate to the stores."""
+    """Start the camera's sequence at the first acquisition, open the gate to the stores, and stop both at unstage."""
 
     acquire: SignalRW[bool]
     capture: SignalRW[bool]
@@ -92,11 +92,12 @@ class MMAcquireLogic(DetectorAcquireLogic):
     last_error: SignalR[str]
 
     async def ensure_ready(self) -> None:
-        """Start the camera's sequence."""
-        await self.acquire.set(True)
+        """Leave the camera idle, as staging starts no sequence."""
 
     async def start_acquiring(self) -> None:
-        """Open the gate to the stores."""
+        """Start the camera's sequence unless it runs, then open the gate to the stores."""
+        if not await self.acquire.get_value():
+            await self.acquire.set(True)
         await self.capture.set(True)
 
     async def wait_for_idle(self) -> None:

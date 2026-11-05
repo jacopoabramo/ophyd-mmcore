@@ -149,6 +149,7 @@ async def main():
     camera = MMCamera("Camera", core, path_provider=provider, name="camera")
     await camera.connect()
     await camera.stage()
+    await camera.acquire.set(True)
 
 asyncio.run(main())
 """

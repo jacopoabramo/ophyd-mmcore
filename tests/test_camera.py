@@ -108,6 +108,23 @@ async def test_unstage_mid_capture_closes_the_store(uni_core, tmp_path):
     assert uni_core.getAutoShutter() is True
 
 
+async def test_first_trigger_starts_the_sequence(uni_core, tmp_path):
+    """Start the camera's sequence at the first trigger, not at stage."""
+    async with init_devices():
+        cam = MMCamera(
+            "Cam",
+            uni_core,
+            path_provider=StaticPathProvider(UUIDFilenameProvider(), tmp_path),
+        )
+    await cam.stage()
+    assert not uni_core.isSequenceRunning()
+    await cam.prepare(TriggerInfo(number_of_events=1))
+    await cam.trigger()
+    assert uni_core.isSequenceRunning()
+    await cam.unstage()
+    assert not uni_core.isSequenceRunning()
+
+
 async def faulting_camera(core: CMMCorePlus, tmp_path: Path) -> MMCamera:
     """Return a mock camera that faults with "boom" when its capture starts."""
     async with init_devices(mock=True):
