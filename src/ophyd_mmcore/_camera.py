@@ -248,7 +248,7 @@ class MMCamera(StandardDetector):
         )
 
     @contextlib.asynccontextmanager
-    async def raise_on_fault(self) -> AsyncGenerator[None, None]:
+    async def _raise_on_fault(self) -> AsyncGenerator[None, None]:
         """Stop the block as soon as the camera faults.
 
         Raises
@@ -279,13 +279,13 @@ class MMCamera(StandardDetector):
     @WatchableAsyncStatus.wrap
     async def trigger(self) -> AsyncIterator[WatcherUpdate[int]]:
         """Take one collection, failing with the camera's last error if it faults."""
-        async with self.raise_on_fault():
+        async with self._raise_on_fault():
             async for update in inspect.unwrap(StandardDetector.trigger)(self):
                 yield update
 
     @WatchableAsyncStatus.wrap
     async def complete(self) -> AsyncIterator[WatcherUpdate[int]]:
         """Wait for the kicked-off collections, failing with the camera's last error if it faults."""
-        async with self.raise_on_fault():
+        async with self._raise_on_fault():
             async for update in inspect.unwrap(StandardDetector.complete)(self):
                 yield update
