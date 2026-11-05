@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import threading
 import time
 from collections.abc import AsyncIterator
@@ -318,3 +319,23 @@ async def test_buffer_overflow_faults_the_camera(cam_signals, uni_core, monkeypa
     await wait_for_value(cam_signals.state, CameraState.FAULTED, timeout=5)
     assert "overflowed" in await cam_signals.last_error.get_value()
     await wait_until(lambda: not uni_core.isSequenceRunning("Cam"))
+
+
+async def test_cancelled_change_logs_its_error(
+    cam_signals, uni_core, monkeypatch, caplog
+):
+    """Log the error of a camera change whose caller was cancelled."""
+    entered = threading.Event()
+
+    def failing_start(*args) -> None:
+        entered.set()
+        time.sleep(0.1)
+        raise RuntimeError("camera unplugged")
+
+    monkeypatch.setattr(uni_core, "startSequenceAcquisition", failing_start)
+    status = cam_signals.acquire.set(True)
+    await asyncio.to_thread(entered.wait, 5)
+    status.task.cancel()
+    with caplog.at_level(logging.ERROR), pytest.raises(asyncio.CancelledError):
+        await status
+    assert "camera unplugged" in caplog.text

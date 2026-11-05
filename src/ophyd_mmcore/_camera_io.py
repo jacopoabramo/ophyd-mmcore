@@ -368,7 +368,8 @@ class CameraIO:
 
         A cancelled caller waits for the change to finish before the
         cancellation is raised, because the core calls it makes run on in
-        their threads and the flags must end up matching them.
+        their threads and the flags must end up matching them. An error of
+        the change is then logged.
         """
         async with self._write_lock:
             task = asyncio.ensure_future(change(*args))
@@ -379,8 +380,12 @@ class CameraIO:
                 except asyncio.CancelledError:
                     cancelled = True
             if cancelled:
-                if not task.cancelled():
-                    task.exception()
+                if not task.cancelled() and (error := task.exception()) is not None:
+                    logger.error(
+                        "A change of camera %r failed after its caller was cancelled",
+                        self.label,
+                        exc_info=error,
+                    )
                 raise asyncio.CancelledError
             return task.result()
 
