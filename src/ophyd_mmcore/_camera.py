@@ -83,7 +83,10 @@ class MMTriggerLogic(DetectorTriggerLogic):
 
 @dataclass
 class MMAcquireLogic(DetectorAcquireLogic):
-    """Start the camera's sequence at the first acquisition, open the gate to the stores, and stop both at unstage."""
+    """Run the camera's sequence from its first acquisition to unstage.
+
+    Each acquisition opens the gate to the stores.
+    """
 
     acquire: SignalRW[bool]
     capture: SignalRW[bool]

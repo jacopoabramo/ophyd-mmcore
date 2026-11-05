@@ -7,18 +7,19 @@
 ```
 src/ophyd_mmcore/
   __init__.py      public names and __all__
-  _controller.py   MMController: calls, events, stage targets, XY lock
+  _controller.py   MMController: calls, events, stage targets, XY lock;
+                   one controller per core, the exit hook
   _camera_io.py    controller side of a camera: flags, pause, cache, store
   _frames.py       the frame router thread
   _backend.py      signal and command backends, the source type, CameraState
   _connector.py    MMConnector, the markers, name cleaning
-  _devices.py      MMDevice, MMSystem, MMMoveLogic, MMShutter, MMStateDevice,
-                   MMConfigGroup
+  _devices.py      MMDevice, MMMoveLogic, MMShutter, MMStateDevice, MMConfigGroup
   _stage.py        MMZStage, MMAxis, MMXYStage
   _camera.py       MMCamera, MMCameraOutput and the camera logics
-  _config.py       make_devices, make_config_groups
+  _system.py       MMSystem: loading, discovery, key checks, staging children
+  _config.py       loading a configuration file, building discovered children
 tests/
-  conftest.py      fixtures: a UniMMCore with Python devices, the demo configuration
+  conftest.py      fixtures: UniMMCore cores with Python devices, the demo cores
   test_*.py        one module per source module, and test_plans.py end to end
 ```
 
@@ -37,10 +38,10 @@ Add or change dependencies only with `uv add` and `uv remove`. `ruff` runs the r
 
 ## Architecture rule
 
-Only the controller side calls `CMMCorePlus`: `MMController` in `_controller.py`, together with `_camera_io.py`, `_frames.py` and `_config.py`. A device reaches the core through the sources and backends of `_backend.py`, which `MMConnector` binds while it builds the device. A device never calls a controller method and never imports `pymmcore_plus`, which is what lets it run with `connect(mock=True)` and no core.
+Only the controller side calls `CMMCorePlus`: `MMController` in `_controller.py`, together with `_camera_io.py`, `_frames.py` and `_config.py`. A device takes a core but reaches it only through the sources and backends of `_backend.py`, which `MMConnector` binds at `connect()` with the core's controller from `controller_for`. A device never calls a controller method and imports `CMMCorePlus` only for type checking, which is what lets it run with `connect(mock=True)` without creating a controller.
 
 ## Where a new test goes
 
 - The logic of a device and the documents it emits: a device in mock mode, with `connect(mock=True)` and no core.
-- A rule the controller enforces, such as locks, pausing, stores, AutoShutter or faults: the controller on a `UniMMCore`, through the `ctrl` fixture.
+- A rule the controller enforces, such as locks, pausing, stores, AutoShutter or faults: devices built on a `UniMMCore` from the core fixtures, asserting on their signals and on the core's state. No test imports the controller.
 - A plan from start to finish against Micro-Manager's own adapters: `tests/test_plans.py`, marked `demo`, which is skipped without the demo adapters.

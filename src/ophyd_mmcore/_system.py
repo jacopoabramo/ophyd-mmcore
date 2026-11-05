@@ -114,7 +114,9 @@ class SystemConnector(MMConnector):
 
 
 class MMSystem(StandardReadable):
-    """A microscope declared as a class, whose children are marked with [`Label`][ophyd_mmcore.Label].
+    """A microscope whose children are the devices and configuration groups of one core.
+
+    A subclass declares the children it wants typed with [`Label`][ophyd_mmcore.Label].
 
     `source` is a core, or the path of a Micro-Manager configuration file. A
     relative path that does not exist is looked up in the core's device
