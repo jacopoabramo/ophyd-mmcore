@@ -481,35 +481,36 @@ class CameraIO:
 
     def _refresh_layouts(self) -> None:
         """Read every output's layout, making each physical camera current in turn."""
-        core = self._ctrl.core
-        current = core.getCameraDevice()
-        try:
-            for name in self.physical:
-                if core.getCameraDevice() != name:
-                    core.setCameraDevice(name)
-                components = core.getNumberOfComponents()
-                layout = Layout(
-                    width=core.getImageWidth(),
-                    height=core.getImageHeight(),
-                    bytes_per_pixel=core.getBytesPerPixel(),
-                    components=components,
-                    pixel_type=core.getProperty(name, "PixelType")
-                    if core.hasProperty(name, "PixelType")
-                    else ("RGB" if components > 1 else "grayscale"),
-                )
-                previous = self._layouts.get(name)
-                self._layouts[name] = layout
-                for value in ("width", "height", "dtype_numpy"):
-                    if previous is None or getattr(previous, value) != getattr(
-                        layout, value
-                    ):
-                        self._ctrl._dispatch(
-                            (self.label, f"output:{name}:{value}"),
-                            getattr(layout, value),
-                        )
-        finally:
-            if core.getCameraDevice() != current:
-                core.setCameraDevice(current)
+        with self._ctrl._camera_lock:
+            core = self._ctrl.core
+            current = core.getCameraDevice()
+            try:
+                for name in self.physical:
+                    if core.getCameraDevice() != name:
+                        core.setCameraDevice(name)
+                    components = core.getNumberOfComponents()
+                    layout = Layout(
+                        width=core.getImageWidth(),
+                        height=core.getImageHeight(),
+                        bytes_per_pixel=core.getBytesPerPixel(),
+                        components=components,
+                        pixel_type=core.getProperty(name, "PixelType")
+                        if core.hasProperty(name, "PixelType")
+                        else ("RGB" if components > 1 else "grayscale"),
+                    )
+                    previous = self._layouts.get(name)
+                    self._layouts[name] = layout
+                    for value in ("width", "height", "dtype_numpy"):
+                        if previous is None or getattr(previous, value) != getattr(
+                            layout, value
+                        ):
+                            self._ctrl._dispatch(
+                                (self.label, f"output:{name}:{value}"),
+                                getattr(layout, value),
+                            )
+            finally:
+                if core.getCameraDevice() != current:
+                    core.setCameraDevice(current)
 
     def _write_paused(
         self, set_: Callable[[], None], get: Callable[[], Any], pause: bool

@@ -56,6 +56,9 @@ class MMController:
     def __init__(self, core: CMMCorePlus) -> None:
         self._core = core
         self._lock = threading.Lock()
+        # Held while the current camera is switched away and back, so that
+        # two threads never interleave their switches and restores.
+        self._camera_lock = threading.RLock()
         self._subscriptions: dict[EventKey, list[Subscription]] = {}
         self._closed = False
         self._targets: dict[tuple[str, str], Any] = {}
@@ -432,22 +435,23 @@ class MMController:
         self._router.start()
 
     def _begin_sequence(self, label: str, prepare: Callable[[], None]) -> None:
-        # Recorded before the core changes, so that `close` restores it even
-        # when the caller stopped waiting for this call.
-        restore = self._restore = (
-            self._core.getCameraDevice(),
-            self._core.getAutoShutter(),
-        )
-        self._core.setCameraDevice(label)
-        self._core.setAutoShutter(False)
-        try:
-            prepare()
-            self._core.startSequenceAcquisition(label, SEQUENCE_LENGTH, 0, False)
-        except Exception:
-            self._restore = None
-            self._core.setCameraDevice(restore[0])
-            self._core.setAutoShutter(restore[1])
-            raise
+        with self._camera_lock:
+            # Recorded before the core changes, so that `close` restores it even
+            # when the caller stopped waiting for this call.
+            restore = self._restore = (
+                self._core.getCameraDevice(),
+                self._core.getAutoShutter(),
+            )
+            self._core.setCameraDevice(label)
+            self._core.setAutoShutter(False)
+            try:
+                prepare()
+                self._core.startSequenceAcquisition(label, SEQUENCE_LENGTH, 0, False)
+            except Exception:
+                self._restore = None
+                self._core.setCameraDevice(restore[0])
+                self._core.setAutoShutter(restore[1])
+                raise
 
     async def _stop_sequence(self, label: str) -> None:
         """Stop the sequence of `label` and restore the camera and AutoShutter."""
@@ -455,18 +459,19 @@ class MMController:
             await self.call(self._end_sequence)
 
     def _end_sequence(self) -> None:
-        restore, self._restore = self._restore, None
-        try:
-            if self._acquiring is not None:
-                self._core.stopSequenceAcquisition(self._acquiring)
-        finally:
+        with self._camera_lock:
+            restore, self._restore = self._restore, None
             try:
-                self._router.stop()
-                if restore is not None:
-                    self._core.setCameraDevice(restore[0])
-                    self._core.setAutoShutter(restore[1])
+                if self._acquiring is not None:
+                    self._core.stopSequenceAcquisition(self._acquiring)
             finally:
-                self._acquiring = None
+                try:
+                    self._router.stop()
+                    if restore is not None:
+                        self._core.setCameraDevice(restore[0])
+                        self._core.setAutoShutter(restore[1])
+                finally:
+                    self._acquiring = None
 
     def _deliver(self, physical: str, frame: np.ndarray) -> None:
         camera = self._cameras.get(self._acquiring or "")
