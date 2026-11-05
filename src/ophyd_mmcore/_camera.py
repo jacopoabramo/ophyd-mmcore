@@ -246,6 +246,10 @@ class MMCamera(StandardDetector):
             ),
         )
 
+    # TODO: remove this method and the trigger/complete overrides once
+    # ophyd-async lets an acquire logic fail the wait for frames. Each step
+    # runs in its own task because asyncio.wait_for on Python 3.11 can drop
+    # the cancel that a single long-lived task would rely on.
     async def _raise_on_fault(
         self, updates: AsyncGenerator[WatcherUpdate[int], None]
     ) -> AsyncIterator[WatcherUpdate[int]]:
