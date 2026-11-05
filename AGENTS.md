@@ -37,7 +37,7 @@ Add or change dependencies only with `uv add` and `uv remove`. `ruff` runs the r
 
 ## Architecture rule
 
-Only `MMController` calls `CMMCorePlus`. A device reaches the core through the signal and command backends in `_backend.py`, never by calling a controller method, and never imports `pymmcore_plus`. This is what lets a device run with `connect(mock=True)` and no core.
+Only the controller side calls `CMMCorePlus`: `MMController` in `_controller.py`, together with `_camera_io.py`, `_frames.py` and `_config.py`. A device reaches the core through the sources and backends of `_backend.py`, which `MMConnector` binds while it builds the device. A device never calls a controller method and never imports `pymmcore_plus`, which is what lets it run with `connect(mock=True)` and no core.
 
 ## Where a new test goes
 
