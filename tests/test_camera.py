@@ -5,6 +5,7 @@ from typing import Annotated as A
 
 import bluesky.plans as bp
 import pytest
+import zarr
 from bluesky import RunEngine
 from ophyd_async.core import (
     StaticPathProvider,
@@ -13,6 +14,7 @@ from ophyd_async.core import (
     callback_on_mock_put,
     init_devices,
     set_mock_value,
+    wait_for_value,
 )
 
 from ophyd_mmcore import CameraState, Label, MMCamera, MMController, MMSystem
@@ -67,6 +69,26 @@ def test_count_emits_stream_documents(ctrl, tmp_path):
         sum(d["indices"]["stop"] - d["indices"]["start"] for d in docs["stream_datum"])
         == 3
     )
+
+
+async def test_unstage_mid_capture_closes_the_store(ctrl, uni_core, tmp_path):
+    """Unstage a camera mid-capture, keep its frames and restore AutoShutter."""
+    async with init_devices():
+        cam = MMCamera(
+            "Cam",
+            ctrl,
+            path_provider=StaticPathProvider(UUIDFilenameProvider(), tmp_path),
+        )
+    output = cam.outputs["cam"]
+    await cam.stage()
+    await cam.prepare(TriggerInfo(number_of_events=0))
+    path = await output.file_path.get_value()
+    await cam.kickoff()
+    await wait_for_value(output.captured, lambda n: n > 0, timeout=5)
+    await cam.unstage()
+    captured = await output.captured.get_value()
+    assert zarr.open(path)["cam"].shape[0] == captured  # type: ignore[index]
+    assert uni_core.getAutoShutter() is True
 
 
 async def faulting_camera(ctrl: MMController, tmp_path: Path) -> MMCamera:

@@ -216,10 +216,10 @@ async def test_stop_while_capturing_closes_the_store(
 
 
 async def test_store_change_while_capturing_is_refused(cam_signals, tmp_path):
-    """Refuse to close or replace the store during a capture."""
+    """Refuse to replace the store during a capture."""
     await start_capture(cam_signals, tmp_path / "a.zarr", 0)
     with pytest.raises(RuntimeError, match="Cam"):
-        await cam_signals.out.file_path.set("")
+        await cam_signals.out.file_path.set(str(tmp_path / "b.zarr"))
 
 
 async def test_lower_num_capture_closes_the_gate(cam_signals, tmp_path):

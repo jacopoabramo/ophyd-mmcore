@@ -143,7 +143,9 @@ class CameraIO:
     lets frames into the stores, one per physical camera. A setting written
     while the camera acquires is written between a stop and a restart of the
     sequence, and refused while it captures. While it acquires, a setting
-    reads the value last written or read with no sequence running.
+    reads the value last written or read with no sequence running. An
+    output's store cannot be replaced while the camera captures, and clearing
+    its `file_path` then closes the gate before the store.
 
     A frame that cannot be written stops the sequence and faults the camera
     with the error as `last_error`, until `acquire` is set to true again.
@@ -422,9 +424,15 @@ class CameraIO:
 
     async def _change_file_path(self, physical: str, path: str) -> None:
         if self._values["capture"]:
-            raise RuntimeError(
-                f"Cannot change the store of camera {self.label!r} while it captures"
-            )
+            if path:
+                raise RuntimeError(
+                    f"Cannot change the store of camera {self.label!r} while it "
+                    "captures"
+                )
+            # Unstaging clears file_path and the gate at once, so closing the
+            # store also ends the capture rather than racing with it.
+            with self._lock:
+                self._update(capture=False)
         if path:
             self._check_layouts(physical, await self._read_layouts())
             if Path(path).exists():
