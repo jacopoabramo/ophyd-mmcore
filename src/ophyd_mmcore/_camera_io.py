@@ -143,8 +143,9 @@ class CameraIO:
     lets frames into the stores, one per physical camera. A setting written
     while the camera acquires is written between a stop and a restart of the
     sequence, and refused while it captures. While it acquires, a setting
-    reads the value last written or read with no sequence running. An
-    output's store cannot be replaced while the camera captures, and clearing
+    reads the value last written or read with no sequence running. A
+    physical camera of the acquiring camera counts as acquiring and
+    capturing with it. An output's store cannot be replaced while the camera captures, and clearing
     its `file_path` then closes the gate before the store.
 
     A frame that cannot be written stops the sequence and faults the camera
@@ -172,9 +173,17 @@ class CameraIO:
         self._lock = threading.Lock()
         self._write_lock = asyncio.Lock()
 
+    def _sequence_camera(self) -> "CameraIO":
+        """Return the acquiring camera when it sends this camera's frames, else this camera."""
+        acquiring = self._ctrl._cameras.get(self._ctrl._acquiring or "")
+        if acquiring is not None and self.label in acquiring.physical:
+            return acquiring
+        return self
+
     @property
     def _running(self) -> bool:
-        return self._values["acquire"] and not self._faulted
+        camera = self._sequence_camera()
+        return camera._values["acquire"] and not camera._faulted
 
     def source(self, name: CameraValueName) -> MMSource[Any]:
         """Return the source of the camera's exposure or one of its flags."""
@@ -251,7 +260,9 @@ class CameraIO:
         RuntimeError
             If the camera is capturing.
         """
-        return await self._serialised(self._change_setting, key, set_, get)
+        return await self._sequence_camera()._serialised(
+            self._change_setting, key, set_, get
+        )
 
     def deliver(self, physical: str, frame: np.ndarray) -> bool:
         """Append a frame to its output's store while the gate is open.
@@ -373,11 +384,13 @@ class CameraIO:
     async def _change_setting(
         self, key: str, set_: Callable[[], None], get: Callable[[], Any]
     ) -> Any:
-        if self._values["capture"]:
+        camera = self._sequence_camera()
+        if camera._values["capture"]:
             raise RuntimeError(
-                f"Cannot change {key} of camera {self.label!r} while it captures"
+                f"Cannot change {key} of camera {self.label!r} while camera "
+                f"{camera.label!r} captures"
             )
-        value = await self._ctrl.call(self._write_paused, set_, get, self._running)
+        value = await self._ctrl.call(camera._write_paused, set_, get, self._running)
         self._settings[key] = value
         return value
 

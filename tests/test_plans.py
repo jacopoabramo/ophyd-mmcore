@@ -11,10 +11,16 @@ import bluesky.preprocessors as bpp
 import pytest
 import zarr
 from bluesky import RunEngine
-from ophyd_async.core import StaticPathProvider, TriggerInfo, UUIDFilenameProvider
+from ophyd_async.core import (
+    SignalRW,
+    StaticPathProvider,
+    TriggerInfo,
+    UUIDFilenameProvider,
+)
 from ophyd_async.plan_stubs import ensure_connected
 
 from ophyd_mmcore import MMCamera, make_config_groups, make_devices
+from ophyd_mmcore._backend import MMSignalBackend
 
 pytestmark = pytest.mark.demo
 
@@ -123,3 +129,20 @@ def test_multi_camera_fly_scan_writes_two_stores(multi_ctrl, tmp_path):
         "multi-cam2",
     }
     assert [open_array(r).shape[0] for r in resources] == [6, 6]
+
+
+async def test_physical_camera_write_pauses_the_multi_camera(multi_ctrl):
+    """Write a setting of a physical camera by pausing the acquiring Multi Camera."""
+    multi_ctrl.camera_io("Cam1")
+    multi = multi_ctrl.camera_io("Multi", ("Cam1", "Cam2"))
+    acquire = SignalRW(MMSignalBackend(bool, multi.source("acquire")), name="acquire")
+    binning = SignalRW(
+        MMSignalBackend(int, multi_ctrl.property_source("Cam1", "Binning")),
+        name="binning",
+    )
+    await acquire.connect()
+    await binning.connect()
+    await acquire.set(True)
+    await binning.set(1)
+    assert multi_ctrl.core.isSequenceRunning("Multi")
+    await acquire.set(False)
