@@ -1,8 +1,9 @@
 import contextlib
 import logging
 import os
-from collections.abc import Container
+from collections.abc import Container, Iterable
 from pathlib import Path
+from typing import NamedTuple
 
 from ophyd_async.core import Device, PathProvider
 from pymmcore_plus import CMMCorePlus, DeviceType
@@ -27,6 +28,15 @@ CORE_ROLES = {
     "SLM": DeviceType.SLM,
     "Galvo": DeviceType.Galvo,
 }
+
+DEVICE_TYPES = (
+    DeviceType.Camera,
+    DeviceType.Stage,
+    DeviceType.XYStage,
+    DeviceType.Shutter,
+    DeviceType.State,
+    DeviceType.Generic,
+)
 
 INIT_ORDER = {DeviceType.Serial: 0, DeviceType.Hub: 1}
 
@@ -82,7 +92,8 @@ def resolve_config(path: str | os.PathLike[str], core: CMMCorePlus) -> Path:
     raise FileNotFoundError(f"Configuration file {str(path)!r} not found")
 
 
-# TODO: replace steps 2 to 4 and 6 of this function with
+# TODO: replace the load and initialize loops and the applying of groups, pixel
+# sizes and Core properties in this function with
 # `Microscope.initialize(core, keep_loaded=True)` and
 # `Microscope.apply_to_core(core, exclude={"devices"})` once pymmcore-plus can
 # keep a matching loaded device, apply a parsed model and skip empty core values.
@@ -129,6 +140,8 @@ def load_config(core: CMMCorePlus, model: Microscope) -> None:
             core.initializeDevice(device.name)
             uninitialized.remove(device.name)
             device.apply_to_core(core, then_update=False)
+            if device.delay_ms:
+                core.setDeviceDelayMs(device.name, device.delay_ms)
     except BaseException:
         for name in reversed(uninitialized):
             with contextlib.suppress(RuntimeError):
@@ -155,27 +168,60 @@ def load_config(core: CMMCorePlus, model: Microscope) -> None:
     core.waitForSystem()
 
 
+class FoundDevice(NamedTuple):
+    """A loaded device of the core, as read by `find_devices`."""
+
+    label: str
+    type: DeviceType
+    physical: list[str]
+
+
 def physical_cameras(core: CMMCorePlus, label: str) -> list[str]:
     """Return the labels set in the physical camera properties of a Multi Camera."""
     values = (core.getProperty(label, prop) for prop in MULTI_CAMERA_PROPERTIES)
     return [value for value in values if value != "Undefined"]
 
 
+def find_devices(core: CMMCorePlus, skip: Container[str]) -> list[FoundDevice]:
+    """Read the label and type of each loaded device the devices cover, except those in `skip`.
+
+    The core, hubs, serial ports and other types the devices do not cover are
+    left out. A camera of the `Utilities` adapter named `Multi Camera` also
+    gets the labels in its physical camera properties.
+    """
+    found = []
+    for label in core.getLoadedDevices():
+        device_type = core.getDeviceType(label)
+        if label in skip or device_type not in DEVICE_TYPES:
+            continue
+        physical = (
+            physical_cameras(core, label)
+            if device_type == DeviceType.Camera
+            and core.getDeviceLibrary(label) == "Utilities"
+            and core.getDeviceName(label) == "Multi Camera"
+            else []
+        )
+        found.append(FoundDevice(label, device_type, physical))
+    return found
+
+
+def find_groups(core: CMMCorePlus, skip: Container[str]) -> list[str]:
+    """Read the name of each configuration group of the core, except those in `skip`."""
+    return [group for group in core.getAvailableConfigGroups() if group not in skip]
+
+
 def build_devices(
     core: CMMCorePlus,
+    found: Iterable[FoundDevice],
     *,
     path_provider: PathProvider | None,
     move_timeout: float | None,
-    skip: Container[str],
 ) -> dict[str, Device]:
-    """Build an ophyd-async device for each device the core has loaded, except those in `skip`.
+    """Build an ophyd-async device for each of `found`.
 
     The class follows the Micro-Manager device type: `MMCamera`, `MMZStage`,
-    `MMXYStage`, `MMShutter`, `MMStateDevice` or `MMDevice`. Other types, such
-    as the core, hubs and serial ports, get none. A camera of the `Utilities`
-    adapter named `Multi Camera` gets the labels in its physical camera
-    properties as `physical`. Each key is the cleaned label and each device is
-    named by its key. Nothing is connected.
+    `MMXYStage`, `MMShutter`, `MMStateDevice` or `MMDevice`. Each key is the
+    cleaned label and each device is named by its key. Nothing is connected.
 
     All cameras share `path_provider`, which ophyd-async calls with each data
     key. Use a filename provider that depends on that key: two outputs with the
@@ -190,18 +236,10 @@ def build_devices(
     """
     devices: dict[str, Device] = {}
     labels: dict[str, str] = {}
-    for label in core.getLoadedDevices():
-        if label in skip:
-            continue
+    for label, device_type, physical in found:
         key = clean_name(label)
-        match core.getDeviceType(label):
+        match device_type:
             case DeviceType.Camera:
-                physical = (
-                    physical_cameras(core, label)
-                    if core.getDeviceLibrary(label) == "Utilities"
-                    and core.getDeviceName(label) == "Multi Camera"
-                    else []
-                )
                 device = MMCamera(
                     label,
                     core,
@@ -217,10 +255,8 @@ def build_devices(
                 device = MMShutter(label, core, move_timeout=move_timeout, name=key)
             case DeviceType.State:
                 device = MMStateDevice(label, core, move_timeout=move_timeout, name=key)
-            case DeviceType.Generic:
-                device = MMDevice(label, core, name=key)
             case _:
-                continue
+                device = MMDevice(label, core, name=key)
         if key in devices:
             raise ValueError(
                 f"Device labels {labels[key]!r} and {label!r} both clean to {key!r}"
@@ -231,9 +267,9 @@ def build_devices(
 
 
 def build_groups(
-    core: CMMCorePlus, *, move_timeout: float | None, skip: Container[str]
+    core: CMMCorePlus, found: Iterable[str], *, move_timeout: float | None
 ) -> dict[str, MMConfigGroup]:
-    """Build an `MMConfigGroup` for each configuration group of the core, except those in `skip`.
+    """Build an `MMConfigGroup` for each group name of `found`.
 
     Each key is the cleaned group name followed by `_group`, and each group is
     named by its key, so its data keys differ from those of a device with the
@@ -246,9 +282,7 @@ def build_groups(
     """
     groups: dict[str, MMConfigGroup] = {}
     names: dict[str, str] = {}
-    for group in core.getAvailableConfigGroups():
-        if group in skip:
-            continue
+    for group in found:
         key = f"{clean_name(group)}_group"
         if key in groups:
             raise ValueError(

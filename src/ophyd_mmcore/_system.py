@@ -10,7 +10,14 @@ from ophyd_async.core import (
 )
 from ophyd_async.core._device import DEVICE_RESERVED_ATTRS
 
-from ._config import build_devices, build_groups, load_config, open_source
+from ._config import (
+    build_devices,
+    build_groups,
+    find_devices,
+    find_groups,
+    load_config,
+    open_source,
+)
 from ._connector import MMConnector
 
 if TYPE_CHECKING:
@@ -61,34 +68,32 @@ class SystemConnector(MMConnector):
             attribute of a declared child for another label, or an attribute
             of the root.
         """
-        if self.core is not None and isinstance(device, StandardReadable):
+        if self.core is not None:
             if self.model is not None:
                 await asyncio.to_thread(load_config, self.core, self.model)
             await self.discover(self.core, device)
         await super().connect_real(device, timeout, force_reconnect)
 
-    async def discover(self, core: "CMMCorePlus", device: StandardReadable) -> None:
+    async def discover(self, core: "CMMCorePlus", device: Device) -> None:
         """Attach a child to `device` for each device and group of `core` it does not declare."""
         declared: dict[str, MMConnector] = {}
         for attr, child in device.children():
             connector = getattr(child, "_connector", None)
             if isinstance(connector, MMConnector) and connector.label:
                 declared[attr] = connector
-        devices, groups = await asyncio.to_thread(
+        found_devices, found_groups = await asyncio.to_thread(
             lambda: (
-                build_devices(
-                    core,
-                    path_provider=self.path_provider,
-                    move_timeout=self.move_timeout,
-                    skip={c.label for c in declared.values() if not c.group},
-                ),
-                build_groups(
-                    core,
-                    move_timeout=self.move_timeout,
-                    skip={c.label for c in declared.values() if c.group},
-                ),
+                find_devices(core, {c.label for c in declared.values() if not c.group}),
+                find_groups(core, {c.label for c in declared.values() if c.group}),
             )
         )
+        devices = build_devices(
+            core,
+            found_devices,
+            path_provider=self.path_provider,
+            move_timeout=self.move_timeout,
+        )
+        groups = build_groups(core, found_groups, move_timeout=self.move_timeout)
         for key in devices.keys() & groups.keys():
             raise ValueError(
                 f"Device {connector_of(devices[key]).label!r} and configuration "
@@ -102,6 +107,8 @@ class SystemConnector(MMConnector):
                     f"{label!r} would be added as {key!r}, which is declared "
                     f"for {declared[key].label!r}"
                 )
+            if not key:
+                raise ValueError(f"{label!r} would be added with an empty key")
             if key in DEVICE_RESERVED_ATTRS or hasattr(device, key):
                 raise ValueError(
                     f"{label!r} would be added as {key!r}, which the root "

@@ -6,7 +6,7 @@ from typing import cast
 import bluesky.plans as bp
 import pytest
 from bluesky import RunEngine
-from conftest import FakeStage, provider
+from conftest import FakeStage, provider, release
 from ophyd_async.plan_stubs import ensure_connected
 from pymmcore_plus import CMMCorePlus
 
@@ -44,6 +44,24 @@ async def test_load_matches_load_system_configuration(demo_core, tmp_path):
 
 
 @pytest.mark.demo
+async def test_load_applies_device_delays(demo_core, tmp_path):
+    """Set the delay a configuration file gives a device, as loadSystemConfiguration does."""
+    cfg = tmp_path / "scope.cfg"
+    cfg.write_text(
+        "Property,Core,Initialize,0\nDevice,Wheel,DemoCamera,DWheel\n"
+        "Property,Core,Initialize,1\nDelay,Wheel,50.0\n"
+    )
+    reference = CMMCorePlus()
+    try:
+        reference.loadSystemConfiguration(cfg)
+        await MMSystem(cfg, core=demo_core, path_provider=provider(tmp_path)).connect()
+        assert reference.getDeviceDelayMs("Wheel") == 50.0
+        assert demo_core.getDeviceDelayMs("Wheel") == 50.0
+    finally:
+        release(reference)
+
+
+@pytest.mark.demo
 async def test_relative_path_is_found_in_adapter_paths(
     demo_core, tmp_path, monkeypatch
 ):
@@ -72,11 +90,13 @@ async def test_failed_initialize_unloads_uninitialized_devices(
 ):
     """Unload every device loaded but not initialized when one fails to initialize."""
     original = demo_core.initializeDevice
+    initialized = []
 
     def failing(label):
         if label == "Z":
             raise RuntimeError("boom")
         original(label)
+        initialized.append(label)
 
     monkeypatch.setattr(demo_core, "initializeDevice", failing)
     scope = MMSystem(
@@ -84,7 +104,8 @@ async def test_failed_initialize_unloads_uninitialized_devices(
     )
     with pytest.raises(RuntimeError, match="boom"):
         await scope.connect()
-    assert "Z" not in demo_core.getLoadedDevices()
+    assert initialized
+    assert set(demo_core.getLoadedDevices()) == {"Core", *initialized}
     monkeypatch.undo()
     await scope.connect(force_reconnect=True)
     assert "Z" in demo_core.getLoadedDevices()
@@ -169,7 +190,7 @@ async def test_device_and_group_keys_clash(uni_core, tmp_path):
         await MMSystem(uni_core, path_provider=provider(tmp_path)).connect()
 
 
-@pytest.mark.parametrize("label", ["Name", "Parent", "Connect"])
+@pytest.mark.parametrize("label", ["Name", "Parent", "Connect", "Trigger", "Kickoff"])
 async def test_label_naming_a_root_attribute_is_refused(uni_core, tmp_path, label):
     """Refuse a device whose key is an attribute the root already has."""
     uni_core.loadPyDevice(label, FakeStage())
@@ -190,6 +211,14 @@ async def test_colliding_labels_raise(bare_core, tmp_path):
         bare_core.loadPyDevice(label, FakeStage())
         bare_core.initializeDevice(label)
     with pytest.raises(ValueError, match="Cam-1"):
+        await MMSystem(bare_core, path_provider=provider(tmp_path)).connect()
+
+
+async def test_label_cleaning_to_nothing_is_refused(bare_core, tmp_path):
+    """Refuse a device whose label has no letters or digits to make a key from."""
+    bare_core.loadPyDevice("-", FakeStage())
+    bare_core.initializeDevice("-")
+    with pytest.raises(ValueError, match="empty key"):
         await MMSystem(bare_core, path_provider=provider(tmp_path)).connect()
 
 
@@ -215,3 +244,18 @@ def test_count_of_one_camera_with_two_cameras_in_the_root(uni_core, tmp_path):
 
     RE(plan())
     assert len(docs["event"]) == 2
+
+
+def test_runs_of_each_camera_stage_and_unstage_through_the_root(uni_core, tmp_path):
+    """Stage and unstage the cameras of the root so each run ends with the core idle."""
+    scope = MMSystem(uni_core, path_provider=provider(tmp_path), name="scope")
+    RE = RunEngine()
+    docs = defaultdict(list)
+    RE.subscribe(lambda name, doc: docs[name].append(doc))
+    RE(ensure_connected(scope))
+    for key in ("cam", "cam2"):
+        docs.clear()
+        RE(bp.count([cast("MMCamera", dict(scope.children())[key])]))
+        assert len(docs["event"]) == 1
+        assert not uni_core.isSequenceRunning()
+        assert uni_core.getAutoShutter()
