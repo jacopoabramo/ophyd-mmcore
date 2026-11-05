@@ -4,7 +4,7 @@ import threading
 import pytest
 from ophyd_async.core import init_devices
 
-from ophyd_mmcore import MMXYStage, MMZStage
+from ophyd_mmcore import MMAxis, MMXYStage, MMZStage
 
 
 async def test_z_move_waits_for_idle(uni_core):
@@ -120,3 +120,12 @@ async def test_rejected_move_reads_hardware_and_previous_target(uni_core):
     with pytest.raises(ValueError):
         await z.set(5000.0)
     assert await z.locate() == {"setpoint": 5.0, "readback": 77.0}
+
+
+@pytest.mark.parametrize(
+    "options", [{"axis": "x"}, {"properties": ["Name"]}, {"move_timeout": 3.0}]
+)
+def test_connector_excludes_stage_options(wheel_connector, options):
+    """Refuse a stage given a connector together with an option the connector holds."""
+    with pytest.raises(ValueError):
+        MMAxis(connector=wheel_connector, **options)

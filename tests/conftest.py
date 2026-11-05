@@ -2,6 +2,7 @@
 
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from typing import Annotated as A
 
 import numpy as np
 import pytest
@@ -16,6 +17,8 @@ from pymmcore_plus.experimental.unicore import (
     XYStageDevice,
     pymm_property,
 )
+
+from ophyd_mmcore import Label, MMDevice, MMSystem
 
 
 class FakeCamera(SimpleCameraDevice):
@@ -264,3 +267,20 @@ def multi_core(demo_core: CMMCorePlus) -> CMMCorePlus:
     demo_core.setProperty("Multi", "Physical Camera 2", "Cam2")
     demo_core.setCameraDevice("Multi")
     return demo_core
+
+
+@pytest.fixture
+def wheel_connector(bare_core: UniMMCore):
+    """Return the connector a declared child labelled `Wheel` receives."""
+    received = []
+
+    class Recorder(MMDevice):
+        def __init__(self, *, connector, name: str = "") -> None:
+            received.append(connector)
+            super().__init__(name=name, connector=connector)
+
+    class Holder(MMSystem):
+        wheel: A[Recorder, Label("Wheel")]
+
+    Holder(bare_core)
+    return received[0]

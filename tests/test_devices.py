@@ -129,6 +129,26 @@ def test_device_needs_a_label_or_a_connector():
         MMDevice("Wheel")
 
 
+def test_label_and_connector_are_exclusive(bare_core, wheel_connector):
+    """Refuse a device given both a label and a connector."""
+    with pytest.raises(ValueError):
+        MMDevice("Wheel", bare_core, connector=wheel_connector)
+
+
+@pytest.mark.parametrize(
+    ("cls", "options"),
+    [
+        (MMShutter, {"properties": ["Name"]}),
+        (MMStateDevice, {"move_timeout": 3.0}),
+        (MMConfigGroup, {"move_timeout": 3.0}),
+    ],
+)
+def test_connector_excludes_options(wheel_connector, cls, options):
+    """Refuse a device given a connector together with an option the connector holds."""
+    with pytest.raises(ValueError):
+        cls(connector=wheel_connector, **options)
+
+
 def test_construction_does_not_touch_the_core(bare_core):
     """Build a device on a core that lacks its label without raising."""
     MMZStage("Z", bare_core, name="z")
