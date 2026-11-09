@@ -1,14 +1,13 @@
 from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import cached_property
+from typing import TYPE_CHECKING, ClassVar, Literal
 from typing import Annotated as A
-from typing import ClassVar, Literal
 
 from bluesky.protocols import Location
 from ophyd_async.core import (
     DeviceMap,
     MovableLogic,
-    PathProvider,
     SignalDatatypeT,
     SignalRW,
     StandardMovable,
@@ -27,7 +26,9 @@ from ._connector import (
     StateLabel,
     clean_name,
 )
-from ._controller import MMController
+
+if TYPE_CHECKING:
+    from pymmcore_plus import CMMCorePlus
 
 
 def property_map(connector: MMConnector) -> DeviceMap[SignalRW]:
@@ -54,31 +55,32 @@ def property_map(connector: MMConnector) -> DeviceMap[SignalRW]:
 class MMDevice(StandardReadable):
     """A Micro-Manager device, addressed by its label.
 
-    Pass either `label` with `ctrl`, or a `connector`, as a declared child
+    Pass either `label` with `core`, or a `connector`, as a declared child
     receives. Annotated signals are declared with [`Property`][ophyd_mmcore.Property].
     Each name in `properties` becomes a signal in the `properties` map, which
-    `read_configuration` reports.
+    `read_configuration` reports. The core is first used at `connect`, which
+    raises `NotConnectedError` when the core has not loaded the label.
     """
 
     def __init__(
         self,
         label: str = "",
-        ctrl: MMController | None = None,
+        core: "CMMCorePlus | None" = None,
         *,
         properties: Sequence[str] = (),
         name: str = "",
         connector: MMConnector | None = None,
     ) -> None:
         if connector is not None:
-            if label or ctrl is not None or properties:
+            if label or core is not None or properties:
                 raise ValueError(
-                    "MMDevice takes either a connector or a label, ctrl and "
+                    "MMDevice takes either a connector or a label, core and "
                     "properties, not both"
                 )
-        elif ctrl is None:
-            raise ValueError("MMDevice needs either a ctrl or a connector")
+        elif core is None:
+            raise ValueError("MMDevice needs either a core or a connector")
         else:
-            connector = MMConnector(ctrl, label, properties=properties)
+            connector = MMConnector(core, label, properties=properties)
         self._label = connector.label
         self._mm_connector = connector
         super().__init__(name=name, connector=connector)
@@ -89,25 +91,6 @@ class MMDevice(StandardReadable):
     def label(self) -> str:
         """The Micro-Manager label of the device."""
         return self._label
-
-
-class MMSystem(StandardReadable):
-    """A microscope declared as a class, whose children are marked with [`Label`][ophyd_mmcore.Label]."""
-
-    def __init__(
-        self,
-        ctrl: MMController,
-        *,
-        path_provider: PathProvider | None = None,
-        move_timeout: float | None = 10.0,
-        name: str = "",
-    ) -> None:
-        super().__init__(
-            name=name,
-            connector=MMConnector(
-                ctrl, path_provider=path_provider, move_timeout=move_timeout
-            ),
-        )
 
 
 @dataclass
@@ -140,7 +123,7 @@ class MMMoveLogic(MovableLogic[SignalDatatypeT]):
 
 
 class MMMovable(StandardMovable[SignalDatatypeT]):
-    """A device that moves through [`MMMoveLogic`][ophyd_mmcore.MMMoveLogic]."""
+    """A device that moves through [`MMMoveLogic`][ophyd_mmcore._devices.MMMoveLogic]."""
 
     async def locate(self) -> Location[SignalDatatypeT]:
         """Return the stored target as the setpoint and the hardware value as the readback."""
@@ -149,27 +132,27 @@ class MMMovable(StandardMovable[SignalDatatypeT]):
 
 def movable_connector(
     label: str,
-    ctrl: MMController | None,
+    core: "CMMCorePlus | None",
     axis: Literal["x", "y"] | None,
     properties: Sequence[str],
     move_timeout: float | None,
     connector: MMConnector | None,
-) -> tuple[str, MMController | None, Sequence[str], MMConnector | None]:
+) -> tuple[str, "CMMCorePlus | None", Sequence[str], MMConnector | None]:
     """Return the arguments for `MMDevice`, with the options of a moving device put into a connector."""
     if connector is not None:
         if axis is not None or properties or move_timeout != 10.0:
             raise ValueError(
                 "A device given a connector takes no axis, properties or move_timeout"
             )
-        return label, ctrl, properties, connector
-    if ctrl is None:
-        return label, ctrl, properties, connector
+        return label, core, properties, connector
+    if core is None:
+        return label, core, properties, connector
     return (
         "",
         None,
         (),
         MMConnector(
-            ctrl, label, axis=axis, properties=properties, move_timeout=move_timeout
+            core, label, axis=axis, properties=properties, move_timeout=move_timeout
         ),
     )
 
@@ -189,18 +172,18 @@ class MMShutter(MMMovable[bool], MMDevice):
     def __init__(
         self,
         label: str = "",
-        ctrl: MMController | None = None,
+        core: "CMMCorePlus | None" = None,
         *,
         properties: Sequence[str] = (),
         move_timeout: float | None = 10.0,
         name: str = "",
         connector: MMConnector | None = None,
     ) -> None:
-        label, ctrl, properties, connector = movable_connector(
-            label, ctrl, None, properties, move_timeout, connector
+        label, core, properties, connector = movable_connector(
+            label, core, None, properties, move_timeout, connector
         )
         super().__init__(
-            label, ctrl, properties=properties, name=name, connector=connector
+            label, core, properties=properties, name=name, connector=connector
         )
 
     @cached_property
@@ -230,18 +213,18 @@ class MMStateDevice(MMMovable[str], MMDevice):
     def __init__(
         self,
         label: str = "",
-        ctrl: MMController | None = None,
+        core: "CMMCorePlus | None" = None,
         *,
         properties: Sequence[str] = (),
         move_timeout: float | None = 10.0,
         name: str = "",
         connector: MMConnector | None = None,
     ) -> None:
-        label, ctrl, properties, connector = movable_connector(
-            label, ctrl, None, properties, move_timeout, connector
+        label, core, properties, connector = movable_connector(
+            label, core, None, properties, move_timeout, connector
         )
         super().__init__(
-            label, ctrl, properties=properties, name=name, connector=connector
+            label, core, properties=properties, name=name, connector=connector
         )
 
     @cached_property
@@ -272,21 +255,22 @@ class MMConfigGroup(MMMovable[str], StandardReadable):
     def __init__(
         self,
         group: str = "",
-        ctrl: MMController | None = None,
+        core: "CMMCorePlus | None" = None,
         *,
         move_timeout: float | None = 10.0,
         name: str = "",
         connector: MMConnector | None = None,
     ) -> None:
-        group, ctrl, _, connector = movable_connector(
-            group, ctrl, None, (), move_timeout, connector
+        group, core, _, connector = movable_connector(
+            group, core, None, (), move_timeout, connector
         )
         if connector is None:
-            raise ValueError("MMConfigGroup needs either a ctrl or a connector")
-        if group or ctrl is not None:
+            raise ValueError("MMConfigGroup needs either a core or a connector")
+        if group or core is not None:
             raise ValueError(
-                "MMConfigGroup takes either a connector or a group and ctrl, not both"
+                "MMConfigGroup takes either a connector or a group and core, not both"
             )
+        connector.group = True
         self._mm_connector = connector
         super().__init__(name=name, connector=connector)
 

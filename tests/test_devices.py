@@ -2,11 +2,12 @@ import asyncio
 from typing import Annotated as A
 
 import pytest
+from conftest import provider
 from ophyd_async.core import (
     Command,
+    NotConnectedError,
     SignalR,
     SignalRW,
-    TriggerableCommand,
     init_devices,
 )
 from ophyd_async.core import StandardReadableFormat as Format
@@ -23,7 +24,6 @@ from ophyd_mmcore import (
     MMZStage,
     Property,
 )
-from ophyd_mmcore._connector import Halt, MMConnector, clean_name
 
 
 @pytest.mark.parametrize(
@@ -36,44 +36,44 @@ from ophyd_mmcore._connector import Halt, MMConnector, clean_name
         ("Exposure", "exposure"),
     ],
 )
-def test_clean_name(raw, clean):
-    """Turn Micro-Manager names into lower-case identifiers."""
-    assert clean_name(raw) == clean
+def test_property_key_is_the_cleaned_name(bare_core, raw, clean):
+    """Key a property signal by its Micro-Manager name turned into a lower-case identifier."""
+    assert list(MMDevice("Cam", bare_core, properties=[raw]).properties) == [clean]
 
 
 class Wheel(MMDevice):
     label_: A[SignalRW[str], Property("Label"), Format.HINTED_SIGNAL]
 
 
-async def test_annotated_property_is_read(ctrl):
+async def test_annotated_property_is_read(uni_core):
     """Read an annotated property as a hinted signal."""
     async with init_devices():
-        wheel = Wheel("Wheel", ctrl)
+        wheel = Wheel("Wheel", uni_core)
     await assert_reading(wheel, {"wheel-label_": partial_reading("A")})
 
 
-async def test_allow_list_goes_to_configuration(ctrl):
+async def test_allow_list_goes_to_configuration(uni_core):
     """Report allow-listed properties in read_configuration only."""
     async with init_devices():
-        cam = MMDevice("Cam", ctrl, properties=["Gain"])
+        cam = MMDevice("Cam", uni_core, properties=["Gain"])
     assert "cam-properties-gain" in await cam.read_configuration()
     assert await cam.read() == {}
 
 
-def test_colliding_property_names_raise(bare_ctrl):
+def test_colliding_property_names_raise(bare_core):
     """Refuse two properties that clean to the same key."""
     with pytest.raises(ValueError, match="Pixel Type"):
-        MMDevice("Cam", bare_ctrl, properties=["PixelType", "Pixel Type"])
+        MMDevice("Cam", bare_core, properties=["PixelType", "Pixel Type"])
 
 
 class Bench(MMSystem):
     wheel: A[Wheel, Label("Wheel", properties=("State",)), Format.CHILD]
 
 
-async def test_system_builds_labelled_children(ctrl):
+async def test_system_builds_labelled_children(uni_core, tmp_path):
     """Build a declared child from its Label and name it after the system."""
     async with init_devices():
-        bench = Bench(ctrl)
+        bench = Bench(uni_core, path_provider=provider(tmp_path))
     await assert_reading(bench, {"bench-wheel-label_": partial_reading("A")})
     assert "bench-wheel-properties-state" in await bench.wheel.read_configuration()
 
@@ -109,69 +109,31 @@ class PropertyOnSystem(MMSystem):
 @pytest.mark.parametrize(
     ("cls", "make", "match"),
     [
-        (Unmarked, lambda c, ctrl: c("Laser", ctrl), "Unmarked.power"),
-        (Doubled, lambda c, ctrl: c("Laser", ctrl), "Doubled.power"),
-        (LabelOnSignal, lambda c, ctrl: c("Laser", ctrl), "LabelOnSignal.power"),
-        (PropertyOnDevice, lambda c, ctrl: c(ctrl), "PropertyOnDevice.wheel"),
-        (UnmarkedCommand, lambda c, ctrl: c("Laser", ctrl), "UnmarkedCommand.halt"),
-        (OptionalUnmarked, lambda c, ctrl: c(ctrl), "OptionalUnmarked.wheel"),
-        (PropertyOnSystem, lambda c, ctrl: c(ctrl), "PropertyOnSystem.power"),
+        (Unmarked, lambda c, core: c("Laser", core), "Unmarked.power"),
+        (Doubled, lambda c, core: c("Laser", core), "Doubled.power"),
+        (LabelOnSignal, lambda c, core: c("Laser", core), "LabelOnSignal.power"),
+        (PropertyOnDevice, lambda c, core: c(core), "PropertyOnDevice.wheel"),
+        (UnmarkedCommand, lambda c, core: c("Laser", core), "UnmarkedCommand.halt"),
+        (OptionalUnmarked, lambda c, core: c(core), "OptionalUnmarked.wheel"),
+        (PropertyOnSystem, lambda c, core: c(core), "PropertyOnSystem.power"),
     ],
 )
-def test_bad_marker_raises(bare_ctrl, cls, make, match):
+def test_bad_marker_raises(bare_core, cls, make, match):
     """Refuse an annotated child with no marker, several, or one that does not fit."""
     with pytest.raises(TypeError, match=match):
-        make(cls, bare_ctrl)
-
-
-def test_label_and_connector_are_exclusive(bare_ctrl):
-    """Refuse a device given both a label and a connector."""
-    with pytest.raises(ValueError):
-        MMDevice("Wheel", bare_ctrl, connector=MMConnector(bare_ctrl, "Wheel"))
+        make(cls, bare_core)
 
 
 def test_device_needs_a_label_or_a_connector():
-    """Refuse a device given neither a controller nor a connector."""
+    """Refuse a device given neither a core nor a connector."""
     with pytest.raises(ValueError):
         MMDevice("Wheel")
 
 
-async def test_shutter_opens(ctrl):
-    """Open the shutter and read it back as open."""
-    async with init_devices():
-        shutter = MMShutter("Shutter", ctrl)
-    await shutter.set(True)
-    assert await shutter.position.get_value() is True
-
-
-async def test_state_device_moves_by_label(ctrl):
-    """Move a state device by label and describe its labels as choices."""
-    async with init_devices():
-        wheel = MMStateDevice("Wheel", ctrl)
-    await wheel.set("C")
-    assert await wheel.position.get_value() == "C"
-    assert (await wheel.describe())["wheel"].get("choices") == ["A", "B", "C", "D"]
-
-
-async def test_config_group_applies_preset(ctrl, uni_core):
-    """Apply a preset and read it back, or an empty name when none matches."""
-    async with init_devices():
-        channel = MMConfigGroup("Channel", ctrl)
-    await channel.set("B")
-    assert await channel.position.get_value() == "B"
-    uni_core.setProperty("Wheel", "Label", "D")
-    assert await channel.position.get_value() == ""
-    assert await channel.locate() == {"setpoint": "B", "readback": ""}
-
-
-async def test_rejected_state_keeps_previous_target(ctrl):
-    """Keep the last target when the core refuses a state label."""
-    async with init_devices():
-        wheel = MMStateDevice("Wheel", ctrl)
-    await wheel.set("B")
-    with pytest.raises(RuntimeError, match="Label not defined"):
-        await wheel.set("Z")
-    assert await wheel.locate() == {"setpoint": "B", "readback": "B"}
+def test_label_and_connector_are_exclusive(bare_core, wheel_connector):
+    """Refuse a device given both a label and a connector."""
+    with pytest.raises(ValueError):
+        MMDevice("Wheel", bare_core, connector=wheel_connector)
 
 
 @pytest.mark.parametrize(
@@ -182,10 +144,67 @@ async def test_rejected_state_keeps_previous_target(ctrl):
         (MMConfigGroup, {"move_timeout": 3.0}),
     ],
 )
-def test_connector_excludes_options(bare_ctrl, cls, options):
+def test_connector_excludes_options(wheel_connector, cls, options):
     """Refuse a device given a connector together with an option the connector holds."""
     with pytest.raises(ValueError):
-        cls(connector=MMConnector(bare_ctrl, "Wheel"), **options)
+        cls(connector=wheel_connector, **options)
+
+
+def test_construction_does_not_touch_the_core(bare_core):
+    """Build a device on a core that lacks its label without raising."""
+    MMZStage("Z", bare_core, name="z")
+
+
+async def test_device_on_missing_label_fails_to_connect(uni_core):
+    """Refuse to connect a device whose label the core has not loaded."""
+    stage = MMZStage("Nope", uni_core, name="stage")
+    with pytest.raises(NotConnectedError, match="Nope"):
+        await stage.connect()
+
+
+async def test_group_on_missing_name_fails_to_connect(uni_core):
+    """Refuse to connect a group the core does not define."""
+    group = MMConfigGroup("Nope", uni_core, name="group")
+    with pytest.raises(NotConnectedError, match="Nope"):
+        await group.connect()
+
+
+async def test_shutter_opens(uni_core):
+    """Open the shutter and read it back as open."""
+    async with init_devices():
+        shutter = MMShutter("Shutter", uni_core)
+    await shutter.set(True)
+    assert await shutter.position.get_value() is True
+
+
+async def test_state_device_moves_by_label(uni_core):
+    """Move a state device by label and describe its labels as choices."""
+    async with init_devices():
+        wheel = MMStateDevice("Wheel", uni_core)
+    await wheel.set("C")
+    assert await wheel.position.get_value() == "C"
+    assert (await wheel.describe())["wheel"].get("choices") == ["A", "B", "C", "D"]
+
+
+async def test_config_group_applies_preset(uni_core):
+    """Apply a preset and read it back, or an empty name when none matches."""
+    async with init_devices():
+        channel = MMConfigGroup("Channel", uni_core)
+    await channel.set("B")
+    assert await channel.position.get_value() == "B"
+    uni_core.setProperty("Wheel", "Label", "D")
+    assert await channel.position.get_value() == ""
+    assert await channel.locate() == {"setpoint": "B", "readback": ""}
+
+
+async def test_rejected_state_keeps_previous_target(uni_core):
+    """Keep the last target when the core refuses a state label."""
+    async with init_devices():
+        wheel = MMStateDevice("Wheel", uni_core)
+    await wheel.set("B")
+    with pytest.raises(RuntimeError, match="Label not defined"):
+        await wheel.set("Z")
+    assert await wheel.locate() == {"setpoint": "B", "readback": "B"}
 
 
 class Scope(MMSystem):
@@ -195,10 +214,10 @@ class Scope(MMSystem):
     channel: A[MMConfigGroup, Label("Channel")]
 
 
-async def test_system_moves_declared_devices(ctrl):
+async def test_system_moves_declared_devices(uni_core, tmp_path):
     """Move every kind of declared child of a system with the system's move timeout."""
     async with init_devices():
-        scope = Scope(ctrl, move_timeout=5.0)
+        scope = Scope(uni_core, path_provider=provider(tmp_path), move_timeout=5.0)
     await asyncio.gather(
         scope.z.set(4.0),
         scope.xy.x.set(1.0),
@@ -214,49 +233,49 @@ async def test_system_moves_declared_devices(ctrl):
     ("build", "signal", "change", "initial", "expected"),
     [
         (
-            lambda ctrl: MMZStage("Z", ctrl),
+            lambda core: MMZStage("Z", core),
             lambda d: d.position,
             lambda core: core.events.stagePositionChanged.emit("Z", 4.0),
             0.0,
             4.0,
         ),
         (
-            lambda ctrl: MMXYStage("XY", ctrl),
+            lambda core: MMXYStage("XY", core),
             lambda d: d.x.position,
             lambda core: core.events.XYStagePositionChanged.emit("XY", 1.0, 2.0),
             0.0,
             1.0,
         ),
         (
-            lambda ctrl: MMXYStage("XY", ctrl),
+            lambda core: MMXYStage("XY", core),
             lambda d: d.y.position,
             lambda core: core.events.XYStagePositionChanged.emit("XY", 1.0, 2.0),
             0.0,
             2.0,
         ),
         (
-            lambda ctrl: MMShutter("Shutter", ctrl),
+            lambda core: MMShutter("Shutter", core),
             lambda d: d.position,
             lambda core: core.setShutterOpen("Shutter", True),
             False,
             True,
         ),
         (
-            lambda ctrl: MMStateDevice("Wheel", ctrl),
+            lambda core: MMStateDevice("Wheel", core),
             lambda d: d.position,
             lambda core: core.setState("Wheel", 2),
             "A",
             "C",
         ),
         (
-            lambda ctrl: MMStateDevice("Wheel", ctrl),
+            lambda core: MMStateDevice("Wheel", core),
             lambda d: d.position,
             lambda core: core.setStateLabel("Wheel", "D"),
             "A",
             "D",
         ),
         (
-            lambda ctrl: MMConfigGroup("Channel", ctrl),
+            lambda core: MMConfigGroup("Channel", core),
             lambda d: d.position,
             lambda core: core.setConfig("Channel", "B"),
             "A",
@@ -266,11 +285,11 @@ async def test_system_moves_declared_devices(ctrl):
     ids=["z", "x", "y", "shutter", "state", "state-label", "config-group"],
 )
 async def test_change_on_the_core_reaches_the_position_signal(
-    ctrl, uni_core, build, signal, change, initial, expected
+    uni_core, build, signal, change, initial, expected
 ):
     """Deliver a change the core reports to a subscriber of the position signal."""
     async with init_devices():
-        device = build(ctrl)
+        device = build(uni_core)
     with MonitorQueue(signal(device)) as queue:
         await queue.assert_updates(initial)
         change(uni_core)
@@ -281,15 +300,7 @@ class GroupProperty(MMConfigGroup):
     power: A[SignalRW[float], Property("Power")]
 
 
-class GroupHalt(MMConfigGroup):
-    halt: A[TriggerableCommand, Halt()]
-
-
-@pytest.mark.parametrize(
-    ("cls", "match"),
-    [(GroupProperty, "GroupProperty.power"), (GroupHalt, "GroupHalt.halt")],
-)
-def test_config_group_refuses_property_and_halt(bare_ctrl, cls, match):
-    """Refuse a Property or a Halt declared on a configuration group."""
-    with pytest.raises(TypeError, match=match):
-        cls("Channel", bare_ctrl)
+def test_config_group_refuses_property(bare_core):
+    """Refuse a Property declared on a configuration group."""
+    with pytest.raises(TypeError, match="GroupProperty.power"):
+        GroupProperty("Channel", bare_core)

@@ -2,10 +2,13 @@
 
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from pathlib import Path
+from typing import Annotated as A
 
 import numpy as np
 import pytest
 from numpy.typing import DTypeLike
+from ophyd_async.core import StaticPathProvider, UUIDFilenameProvider
 from pymmcore_plus import CMMCorePlus
 from pymmcore_plus.experimental.unicore import (
     ShutterDevice,
@@ -17,7 +20,12 @@ from pymmcore_plus.experimental.unicore import (
     pymm_property,
 )
 
-from ophyd_mmcore import MMController
+from ophyd_mmcore import Label, MMDevice, MMSystem
+
+
+def provider(path: Path) -> StaticPathProvider:
+    """Return a path provider that gives each data key a unique file under `path`."""
+    return StaticPathProvider(UUIDFilenameProvider(), path)
 
 
 class FakeCamera(SimpleCameraDevice):
@@ -188,6 +196,13 @@ class FakeWheel(StateDevice):
         self._state = position
 
 
+def release(core: CMMCorePlus) -> None:
+    """Stop a running sequence on `core` and unload its devices."""
+    if core.isSequenceRunning():
+        core.stopSequenceAcquisition()
+    core.unloadAllDevices()
+
+
 @pytest.fixture
 def uni_core() -> Iterator[UniMMCore]:
     """Return a core loaded with the fake devices and a `Channel` group."""
@@ -208,35 +223,25 @@ def uni_core() -> Iterator[UniMMCore]:
     for preset in ("A", "B"):
         core.defineConfig("Channel", preset, "Wheel", "Label", preset)
     yield core
-    core.unloadAllDevices()
+    release(core)
 
 
 @pytest.fixture
-def ctrl(uni_core: UniMMCore) -> Iterator[MMController]:
-    """Return a controller on the `uni_core` fixture, closed after the test."""
-    controller = MMController(uni_core)
-    yield controller
-    controller.close()
-
-
-@pytest.fixture
-def ctrl_with_rgb() -> Iterator[MMController]:
-    """Return a controller on a core with the RGB camera `Rgb`."""
+def rgb_core() -> Iterator[UniMMCore]:
+    """Return a core with the RGB camera `Rgb`."""
     core = UniMMCore()
     core.loadPyDevice("Rgb", RgbCamera())
     core.initializeDevice("Rgb")
-    controller = MMController(core)
-    yield controller
-    controller.close()
-    core.unloadAllDevices()
+    yield core
+    release(core)
 
 
 @pytest.fixture
-def bare_ctrl() -> Iterator[MMController]:
-    """Return a controller on a core with no devices."""
-    controller = MMController(UniMMCore())
-    yield controller
-    controller.close()
+def bare_core() -> Iterator[UniMMCore]:
+    """Return a core with no devices."""
+    core = UniMMCore()
+    yield core
+    release(core)
 
 
 @pytest.fixture
@@ -248,20 +253,19 @@ def demo_core() -> Iterator[CMMCorePlus]:
             "Micro-Manager demo adapters not installed; run mmcore install --test-adapters"
         )
     yield core
-    core.unloadAllDevices()
+    release(core)
 
 
 @pytest.fixture
-def demo_ctrl(demo_core: CMMCorePlus) -> Iterator[MMController]:
-    """Return a controller on the Micro-Manager demo configuration."""
-    controller = MMController.from_config("MMConfig_demo.cfg", demo_core)
-    yield controller
-    controller.close()
+def demo_loaded_core(demo_core: CMMCorePlus) -> CMMCorePlus:
+    """Return the `demo_core` fixture with the Micro-Manager demo configuration loaded."""
+    demo_core.loadSystemConfiguration("MMConfig_demo.cfg")
+    return demo_core
 
 
 @pytest.fixture
-def multi_ctrl(demo_core: CMMCorePlus) -> Iterator[MMController]:
-    """Return a controller on a core with a Multi Camera over two demo cameras."""
+def multi_core(demo_core: CMMCorePlus) -> CMMCorePlus:
+    """Return the `demo_core` fixture with a Multi Camera over two demo cameras."""
     demo_core.loadDevice("Cam1", "DemoCamera", "DCam")
     demo_core.loadDevice("Cam2", "DemoCamera", "DCam")
     demo_core.loadDevice("Multi", "Utilities", "Multi Camera")
@@ -269,6 +273,21 @@ def multi_ctrl(demo_core: CMMCorePlus) -> Iterator[MMController]:
     demo_core.setProperty("Multi", "Physical Camera 1", "Cam1")
     demo_core.setProperty("Multi", "Physical Camera 2", "Cam2")
     demo_core.setCameraDevice("Multi")
-    controller = MMController(demo_core)
-    yield controller
-    controller.close()
+    return demo_core
+
+
+@pytest.fixture
+def wheel_connector(bare_core: UniMMCore):
+    """Return the connector a declared child labelled `Wheel` receives."""
+    received = []
+
+    class Recorder(MMDevice):
+        def __init__(self, *, connector, name: str = "") -> None:
+            received.append(connector)
+            super().__init__(name=name, connector=connector)
+
+    class Holder(MMSystem):
+        wheel: A[Recorder, Label("Wheel")]
+
+    Holder(bare_core)
+    return received[0]
