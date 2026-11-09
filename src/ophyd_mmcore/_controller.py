@@ -68,12 +68,25 @@ def controller_for(core: CMMCorePlus) -> "MMController":
 
 
 def close_controllers() -> None:
-    """Close every live controller, logging a failure instead of raising it."""
+    """Close every live controller, logging a failure instead of raising it.
+
+    Each core's event callback is then unregistered, so the core sends no
+    events for the rest of the interpreter's exit.
+    """
     for controller in list(controllers):
         try:
             controller.close()
         except Exception:
             logger.exception("Closing a controller at exit failed")
+        # TODO: drop once CMMCorePlus unregisters its callback before
+        # finalization. Closing changes properties, and MMCore delivers the
+        # change on its own thread; if that thread still holds a change when
+        # CMMCorePlus.__del__ unregisters the callback during finalization,
+        # Python 3.11 and 3.12 abort on Linux and 3.13 and later hang.
+        try:
+            super(CMMCorePlus, controller.core).registerCallback(None)
+        except Exception:
+            logger.exception("Unregistering the core's callback at exit failed")
 
 
 atexit.register(close_controllers)
