@@ -3,9 +3,9 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
-from bluesky.protocols import Location, Reading
+from bluesky.protocols import Reading
 from event_model import DataKey
 from ophyd_async.core import (
     NO_ARG_VOID_SIGNATURE,
@@ -17,6 +17,9 @@ from ophyd_async.core import (
     StrictEnum,
     make_datakey,
 )
+
+if TYPE_CHECKING:
+    from bluesky.protocols import Location
 
 T = TypeVar("T")
 
@@ -120,13 +123,13 @@ class MMSignalBackend(SignalBackend[SignalDatatypeT]):
     async def get_value(self) -> SignalDatatypeT:
         return self._convert(await self._bound().read())
 
-    async def get_location(self) -> Location[SignalDatatypeT]:
+    async def get_location(self) -> "Location[SignalDatatypeT]":
         source = self._bound()
         readback = await self.get_value()
         if source.setpoint is None:
-            return Location(setpoint=readback, readback=readback)
+            return {"setpoint": readback, "readback": readback}
         setpoint = self._convert(await source.setpoint())
-        return Location(setpoint=setpoint, readback=readback)
+        return {"setpoint": setpoint, "readback": readback}
 
     def set_callback(self, callback: Callback[Reading[SignalDatatypeT]] | None) -> None:
         if callback is None:
