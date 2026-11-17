@@ -20,6 +20,9 @@ from ._frames import FrameRouter
 
 logger = logging.getLogger(__name__)
 
+EXPOSURE_PROPERTY = "Exposure"
+"""The property through which a Micro-Manager camera also takes its exposure."""
+
 P = ParamSpec("P")
 R = TypeVar("R")
 T = TypeVar("T")
@@ -604,6 +607,10 @@ class MMController:
 
     def _on_property(self, label: str, prop: str, value: Any) -> None:
         self._dispatch((label, prop), value)
+        # The core announces an exposure set through the property only as a
+        # property, and one set with setExposure only as an exposure.
+        if prop == EXPOSURE_PROPERTY and label in self._cameras:
+            self._dispatch((label, "core:exposure"), float(value))
 
     def _on_stage_position(self, label: str, position: float) -> None:
         self._dispatch((label, "core:position"), position)
@@ -614,6 +621,7 @@ class MMController:
 
     def _on_exposure(self, label: str, exposure: float) -> None:
         self._dispatch((label, "core:exposure"), exposure)
+        self._dispatch((label, EXPOSURE_PROPERTY), exposure)
 
     def _on_shutter(self, label: str, is_open: bool) -> None:
         self._dispatch((label, "core:open"), is_open)
