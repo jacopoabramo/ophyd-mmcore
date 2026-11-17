@@ -143,7 +143,7 @@ class CameraIO:
     lets frames into the stores, one per physical camera. A setting written
     while the camera acquires is written between a stop and a restart of the
     sequence, and refused while it captures. While it acquires, a setting
-    reads the value last written or read with no sequence running. A
+    reads the value it had when the sequence last started or resumed. A
     physical camera of the acquiring camera counts as acquiring and
     capturing with it. An output's store cannot be replaced while the camera captures, and clearing
     its `file_path` then closes the gate before the store.
@@ -162,6 +162,7 @@ class CameraIO:
         self.physical = physical
         self._outputs = {name: Output() for name in physical}
         self._settings: dict[str, Any] = {}
+        self._getters: dict[str, Callable[[], Any]] = {}
         self._layouts: dict[str, Layout] = {}
         self._values: dict[str, Any] = {
             "acquire": False,
@@ -244,6 +245,7 @@ class CameraIO:
 
     async def read_setting(self, key: str, get: Callable[[], Any]) -> Any:
         """Read a setting, from the cache while the camera acquires."""
+        self._getters[key] = get
         running = self._running
         if running and key in self._settings:
             return self._settings[key]
@@ -405,6 +407,7 @@ class CameraIO:
                 f"{camera.label!r} captures"
             )
         value = await self._ctrl.call(camera._write_paused, set_, get, self._running)
+        self._getters[key] = get
         self._settings[key] = value
         return value
 
@@ -421,7 +424,7 @@ class CameraIO:
                     self._faulted = False
                     self._update(acquire=False)
         if value:
-            await self._ctrl._start_sequence(self.label, self._refresh_layouts)
+            await self._ctrl._start_sequence(self.label, self._refresh)
             with self._lock:
                 self._faulted = False
                 self._update(acquire=True, last_error="")
@@ -507,6 +510,14 @@ class CameraIO:
             )
         return {name: self._layouts[name] for name in self.physical}
 
+    def _refresh(self) -> None:
+        """Read the layouts and cached settings again, with no sequence running."""
+        self._refresh_layouts()
+        for label in {self.label, *self.physical}:
+            if (camera := self._ctrl._cameras.get(label)) is not None:
+                for key, get in list(camera._getters.items()):
+                    camera._settings[key] = get()
+
     def _refresh_layouts(self) -> None:
         """Read every output's layout, making each physical camera current in turn."""
         with self._ctrl._camera_lock:
@@ -554,7 +565,7 @@ class CameraIO:
             try:
                 set_()
                 value = get()
-                self._refresh_layouts()
+                self._refresh()
             finally:
                 core.startSequenceAcquisition(self.label, SEQUENCE_LENGTH, 0, True)
         return value

@@ -316,3 +316,11 @@ async def test_sequence_stopped_by_other_code_faults_the_camera(cam, uni_core):
     uni_core.stopSequenceAcquisition("Cam")
     await wait_for_value(cam.state, CameraState.FAULTED, timeout=5)
     assert "stopped" in await cam.last_error.get_value()
+
+
+async def test_setting_changed_on_the_core_is_read_while_acquiring(cam, uni_core):
+    """Read the exposure the core had when the sequence started, not an older one."""
+    assert await cam.exposure.get_value() == 10.0
+    uni_core.setExposure("Cam", 42.0)
+    await cam.acquire.set(True)
+    assert await cam.exposure.get_value() == 42.0
