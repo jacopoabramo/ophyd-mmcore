@@ -118,7 +118,11 @@ class MMController:
         self._acquiring: str | None = None
         self._restore: tuple[str, bool] | None = None
         self._router = FrameRouter(
-            core, self._deliver, self._on_overflow, self._check_sequence
+            core,
+            self._deliver,
+            self._on_overflow,
+            self._check_sequence,
+            self._on_routing_failure,
         )
         self._dropped: set[str] = set()
         events = core.events
@@ -558,6 +562,12 @@ class MMController:
             camera.fault(
                 f"Frames of camera {camera.label!r} were lost because the "
                 "circular buffer overflowed"
+            )
+
+    def _on_routing_failure(self, error: Exception) -> None:
+        if (camera := self._cameras.get(self._acquiring or "")) is not None:
+            camera.fault(
+                f"The frames of camera {camera.label!r} could not be routed: {error!r}"
             )
 
     def _check_sequence(self) -> None:

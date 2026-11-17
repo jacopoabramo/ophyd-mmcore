@@ -11,6 +11,9 @@ logger = logging.getLogger(__name__)
 IDLE_INTERVAL = 0.1
 """Seconds between two calls of a router's `idle` while the buffer stays empty."""
 
+MAX_FAILURES = 3
+"""The number of failures in a row after which a router calls `failed`."""
+
 
 class FrameRouter:
     """Thread that empties the core's circular buffer.
@@ -20,7 +23,9 @@ class FrameRouter:
     empty the thread sleeps for 1 ms, and calls `idle` at most once every
     100 ms. The first time the buffer has overflowed since the thread
     started, `overflow` is called. An error while popping or delivering a
-    frame is logged and the thread goes on.
+    frame is logged and the thread goes on after 100 ms. The third error in
+    a row is passed to `failed`, and later ones are no longer logged until a
+    frame gets through.
     """
 
     def __init__(
@@ -29,11 +34,13 @@ class FrameRouter:
         deliver: Callable[[str, np.ndarray], None],
         overflow: Callable[[], None],
         idle: Callable[[], None],
+        failed: Callable[[Exception], None],
     ) -> None:
         self._core = core
         self._deliver = deliver
         self._overflow = overflow
         self._idle = idle
+        self._failed = failed
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
 
@@ -57,6 +64,7 @@ class FrameRouter:
 
     def _run(self) -> None:
         overflowed = False
+        failures = 0
         next_idle = time.monotonic() + IDLE_INTERVAL
         while not self._stop.is_set():
             try:
@@ -67,10 +75,22 @@ class FrameRouter:
                     if time.monotonic() >= next_idle:
                         next_idle = time.monotonic() + IDLE_INTERVAL
                         self._idle()
+                    failures = 0
                     time.sleep(0.001)
                     continue
                 frame, metadata = self._core.popNextImageAndMD()
                 self._deliver(metadata["Camera"], frame)
-            except Exception:
-                logger.exception("Frame routing failed")
+                failures = 0
+            except Exception as error:
+                failures += 1
+                if failures <= MAX_FAILURES:
+                    logger.exception("Frame routing failed")
+                if failures == MAX_FAILURES:
+                    self._report(error)
                 time.sleep(0.1)
+
+    def _report(self, error: Exception) -> None:
+        try:
+            self._failed(error)
+        except Exception:
+            logger.exception("Reporting the frame routing failure failed")
