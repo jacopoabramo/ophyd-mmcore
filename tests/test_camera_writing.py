@@ -351,3 +351,13 @@ async def test_frames_that_cannot_be_routed_fault_the_camera(
     await start_capture(cam, tmp_path / "a.zarr", 1)
     await wait_for_value(cam.state, CameraState.FAULTED, timeout=5)
     assert "routed" in await cam.last_error.get_value()
+
+
+async def test_trigger_waits_for_an_exposure_longer_than_the_timeout(cam, monkeypatch):
+    """Give a trigger with no prepare the camera's exposure on top of the timeout."""
+    monkeypatch.setattr("ophyd_async.core._detector.DEFAULT_TIMEOUT", 1.0)
+    monkeypatch.setattr("ophyd_mmcore._camera.DEFAULT_TIMEOUT", 1.0)
+    await cam.exposure.set(1500.0)
+    await cam.stage()
+    await cam.trigger()
+    await cam.unstage()
