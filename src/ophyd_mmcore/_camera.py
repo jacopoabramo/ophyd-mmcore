@@ -8,6 +8,7 @@ from typing import Annotated as A
 
 from ophyd_async.core import (
     DEFAULT_TIMEOUT,
+    AsyncStatus,
     DetectorAcquireLogic,
     DetectorDataLogic,
     DetectorTriggerLogic,
@@ -251,6 +252,24 @@ class MMCamera(StandardDetector):
                 for key, output in outputs.items()
             ),
         )
+
+    @AsyncStatus.wrap
+    async def stage(self) -> None:
+        """Stage the detector and start following its configuration signals.
+
+        While the camera is staged, a configuration signal reads the value
+        the core last announced, so reading it does not call the camera
+        during a sequence.
+        """
+        await super().stage()
+        await asyncio.gather(*(signal.stage() for signal in self._config_signals))
+        await asyncio.gather(*(signal.get_value() for signal in self._config_signals))
+
+    @AsyncStatus.wrap
+    async def unstage(self) -> None:
+        """Stop the detector and stop following its configuration signals."""
+        await super().unstage()
+        await asyncio.gather(*(signal.unstage() for signal in self._config_signals))
 
     # TODO: remove this method and the trigger/complete overrides once
     # ophyd-async lets an acquire logic fail the wait for frames. Each step

@@ -18,7 +18,7 @@ from ophyd_async.testing import MonitorQueue
 from pymmcore_plus import CMMCorePlus
 from pymmcore_plus.experimental.unicore import UniMMCore
 
-from ophyd_mmcore import CameraState, MMCamera
+from ophyd_mmcore import CameraState, MMCamera, MMConfigGroup
 
 
 async def connected_camera(
@@ -293,3 +293,50 @@ async def test_cancelled_change_logs_its_error(cam, uni_core, monkeypatch, caplo
     with caplog.at_level(logging.ERROR), pytest.raises(asyncio.CancelledError):
         await status
     assert "camera unplugged" in caplog.text
+
+
+async def test_run_after_a_faulted_run_triggers(cam, monkeypatch):
+    """Clear a fault at unstage, so that the next run takes its collection."""
+    await cam.stage()
+    with monkeypatch.context() as patch:
+        patch.setattr("ophyd_mmcore._camera_io.FrameStore.append", raising_append)
+        with pytest.raises(RuntimeError, match="disk full"):
+            await cam.trigger()
+    await cam.unstage()
+    assert await cam.state.get_value() == CameraState.IDLE
+    assert "disk full" in await cam.last_error.get_value()
+    await cam.stage()
+    await cam.trigger()
+    await cam.unstage()
+
+
+async def test_sequence_stopped_by_other_code_faults_the_camera(cam, uni_core):
+    """Fault the camera when its sequence stops without the camera stopping it."""
+    await cam.acquire.set(True)
+    uni_core.stopSequenceAcquisition("Cam")
+    await wait_for_value(cam.state, CameraState.FAULTED, timeout=5)
+    assert "stopped" in await cam.last_error.get_value()
+
+
+@pytest.fixture
+async def gains(uni_core: UniMMCore) -> MMConfigGroup:
+    """Return the group `Gains`, whose preset `High` sets the gain of `Cam` to 4."""
+    uni_core.defineConfig("Gains", "High", "Cam", "Gain", "4")
+    group = MMConfigGroup("Gains", uni_core, name="gains")
+    await group.connect()
+    return group
+
+
+async def test_preset_of_an_acquiring_camera_pauses_its_sequence(cam, gains, uni_core):
+    """Apply a preset that sets a property the adapter refuses mid-sequence."""
+    await cam.acquire.set(True)
+    await gains.set("High")
+    assert await cam.properties["gain"].get_value() == 4
+    assert uni_core.isSequenceRunning("Cam")
+
+
+async def test_preset_of_a_capturing_camera_is_refused(cam, gains, tmp_path):
+    """Refuse a preset that sets a property of a camera during its capture."""
+    await start_capture(cam, tmp_path / "a.zarr", 0)
+    with pytest.raises(RuntimeError, match="Gains"):
+        await gains.set("High")

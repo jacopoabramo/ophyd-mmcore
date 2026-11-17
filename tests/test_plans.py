@@ -1,5 +1,6 @@
 """End-to-end plans on the Micro-Manager demo adapters."""
 
+import time
 from collections import defaultdict
 from typing import cast
 from urllib.parse import urlparse
@@ -15,10 +16,11 @@ from ophyd_async.core import (
     StaticPathProvider,
     TriggerInfo,
     UUIDFilenameProvider,
+    wait_for_value,
 )
 from ophyd_async.plan_stubs import ensure_connected
 
-from ophyd_mmcore import MMCamera, MMSystem
+from ophyd_mmcore import CameraState, MMCamera, MMConfigGroup, MMSystem
 
 pytestmark = pytest.mark.demo
 
@@ -174,3 +176,84 @@ async def test_physical_camera_write_pauses_the_multi_camera(multi_core, tmp_pat
         assert multi_core.isSequenceRunning("Multi")
     finally:
         await multi.acquire.set(False)
+
+
+def slow_append(self, frame) -> None:
+    time.sleep(0.05)
+
+
+async def test_buffer_overflow_faults_the_camera(
+    demo_loaded_core, monkeypatch, tmp_path
+):
+    """Fault the camera when frames arrive faster than they are written."""
+    monkeypatch.setattr("ophyd_mmcore._camera_io.FrameStore.append", slow_append)
+    demo_loaded_core.setCircularBufferMemoryFootprint(2)
+    demo_loaded_core.setExposure(1)
+    cam = MMCamera(
+        "Camera",
+        demo_loaded_core,
+        path_provider=StaticPathProvider(UUIDFilenameProvider(), tmp_path),
+        name="cam",
+    )
+    await cam.connect()
+    out = cam.outputs["camera"]
+    await out.file_path.set(str(tmp_path / "a.zarr"))
+    await out.data_key.set("cam")
+    await cam.acquire.set(True)
+    try:
+        await cam.capture.set(True)
+        await wait_for_value(cam.state, CameraState.FAULTED, timeout=5)
+        assert "overflowed" in await cam.last_error.get_value()
+    finally:
+        await cam.capture.set(False)
+        await cam.acquire.set(False)
+        await out.file_path.set("")
+
+
+async def test_staged_camera_follows_settings_changed_on_the_core(
+    demo_loaded_core, tmp_path
+):
+    """Report a setting that other code changed on the core while the sequence runs."""
+    cam = MMCamera(
+        "Camera",
+        demo_loaded_core,
+        path_provider=StaticPathProvider(UUIDFilenameProvider(), tmp_path),
+        properties=["Gain"],
+        name="cam",
+    )
+    await cam.connect()
+    await cam.stage()
+    try:
+        await cam.trigger()
+        demo_loaded_core.setExposure(42.0)
+        demo_loaded_core.setProperty("Camera", "Gain", 2)
+        await wait_for_value(cam.exposure, 42.0, timeout=5)
+        await wait_for_value(cam.properties["gain"], 2, timeout=5)
+        configuration = await cam.read_configuration()
+        assert configuration["cam-exposure"]["value"] == 42.0
+        assert configuration["cam-properties-gain"]["value"] == 2
+    finally:
+        await cam.unstage()
+
+
+async def test_staged_camera_follows_a_preset_the_core_does_not_announce(
+    demo_loaded_core, tmp_path
+):
+    """Report a camera property that a preset changed without an event of the core."""
+    cam = MMCamera(
+        "Camera",
+        demo_loaded_core,
+        path_provider=StaticPathProvider(UUIDFilenameProvider(), tmp_path),
+        properties=["BitDepth"],
+        name="cam",
+    )
+    group = MMConfigGroup("Camera", demo_loaded_core, name="group")
+    await cam.connect()
+    await group.connect()
+    await cam.stage()
+    try:
+        await cam.trigger()
+        await group.set("MedRes")
+        await wait_for_value(cam.properties["bit_depth"], 10, timeout=5)
+    finally:
+        await cam.unstage()
