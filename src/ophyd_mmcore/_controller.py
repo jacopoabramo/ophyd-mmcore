@@ -6,16 +6,17 @@ import time
 import weakref
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal, ParamSpec, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, ParamSpec, TypeVar
 
 import numpy as np
-from event_model import Limits
-from ophyd_async.core import SignalMetadata
 from pymmcore_plus import CMMCorePlus, PropertyType
 
 from ._backend import MMSource
 from ._camera_io import SEQUENCE_LENGTH, CameraIO
 from ._frames import FrameRouter
+
+if TYPE_CHECKING:
+    from ophyd_async.core import SignalMetadata
 
 logger = logging.getLogger(__name__)
 
@@ -184,15 +185,15 @@ class MMController:
         def set_(value: Any) -> None:
             self._core.setProperty(label, prop, value)
 
-        def metadata() -> SignalMetadata:
-            result = SignalMetadata()
+        def metadata() -> "SignalMetadata":
+            result: SignalMetadata = {}
             if self._core.hasPropertyLimits(label, prop):
-                result["limits"] = Limits(
-                    control={
+                result["limits"] = {
+                    "control": {
                         "low": self._core.getPropertyLowerLimit(label, prop),
                         "high": self._core.getPropertyUpperLimit(label, prop),
                     }
-                )
+                }
             if choices := self._core.getAllowedPropertyValues(label, prop):
                 result["choices"] = list(choices)
             return result
@@ -211,7 +212,7 @@ class MMController:
         async def infer() -> type:
             return await self.call(property_type)
 
-        async def describe() -> SignalMetadata:
+        async def describe() -> "SignalMetadata":
             return await self.call(metadata)
 
         return MMSource(
@@ -280,8 +281,8 @@ class MMController:
                 x, y = await self.call(self._core.getXYPosition, label)
                 self._on_xy_position(label, x, y)
 
-        async def metadata() -> SignalMetadata:
-            return SignalMetadata(units="um")
+        async def metadata() -> "SignalMetadata":
+            return {"units": "um"}
 
         name = "position" if axis == "z" else axis
         return MMSource(
@@ -317,7 +318,7 @@ class MMController:
         move: Callable[[T], None],
         wait: Callable[[T], None],
         events: dict[EventKey, Callable[[Any], T] | None],
-        metadata: Callable[[], SignalMetadata] | None = None,
+        metadata: "Callable[[], SignalMetadata] | None" = None,
     ) -> MMSource[T]:
         async def read() -> T:
             value = await self.call(get)
@@ -333,8 +334,8 @@ class MMController:
             await self._store_and_move(key, value, lambda: move(value))
             await self.call(wait, value)
 
-        async def describe() -> SignalMetadata:
-            return SignalMetadata() if metadata is None else await self.call(metadata)
+        async def describe() -> "SignalMetadata":
+            return {} if metadata is None else await self.call(metadata)
 
         def subscribe(callback: Callable[[T, float], None]) -> Callable[[], None]:
             cancels = [
@@ -397,7 +398,7 @@ class MMController:
             lambda value: self._core.setStateLabel(label, value),
             lambda value: self._core.waitForDevice(label),
             {(label, "Label"): None},
-            lambda: SignalMetadata(choices=list(self._core.getStateLabels(label))),
+            lambda: {"choices": list(self._core.getStateLabels(label))},
         )
 
     def preset_source(self, group: str) -> MMSource[str]:
@@ -415,7 +416,7 @@ class MMController:
             lambda value: self._core.setConfig(group, value),
             lambda value: self._core.waitForConfig(group, value),
             {(group, "core:preset"): None},
-            lambda: SignalMetadata(choices=list(self._core.getAvailableConfigs(group))),
+            lambda: {"choices": list(self._core.getAvailableConfigs(group))},
         )
 
     def halt(self, label: str) -> Callable[[], Awaitable[None]]:
