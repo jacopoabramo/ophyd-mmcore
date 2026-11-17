@@ -68,10 +68,9 @@ class SystemConnector(MMConnector):
             attribute of a declared child for another label, or an attribute
             of the root.
         """
-        if self.core is not None:
-            if self.model is not None:
-                await asyncio.to_thread(load_config, self.core, self.model)
-            await self.discover(self.core, device)
+        if self.model is not None:
+            await asyncio.to_thread(load_config, self.core, self.model)
+        await self.discover(self.core, device)
         await super().connect_real(device, timeout, force_reconnect)
 
     async def discover(self, core: "CMMCorePlus", device: Device) -> None:

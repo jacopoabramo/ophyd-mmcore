@@ -133,7 +133,7 @@ class MMConnector(DeviceConnector):
 
     def __init__(
         self,
-        core: "CMMCorePlus | None",
+        core: "CMMCorePlus",
         label: str = "",
         *,
         axis: Literal["x", "y"] | None = None,
@@ -233,8 +233,6 @@ class MMConnector(DeviceConnector):
         NotConnectedError
             If the core has no device, or no configuration group, of the label.
         """
-        if self.core is None:
-            raise NotConnectedError(f"{device.name!r} has no core to connect to")
         ctrl = controller_for(self.core)
         if self.label and not await ctrl.call(ctrl.is_loaded, self.label, self.group):
             kind = "configuration group" if self.group else "device"
