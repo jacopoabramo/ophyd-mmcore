@@ -112,6 +112,29 @@ async def test_failed_initialize_unloads_uninitialized_devices(
 
 
 @pytest.mark.demo
+async def test_retried_load_gives_a_reused_device_its_core_role(
+    demo_core, tmp_path, monkeypatch
+):
+    """Make a camera loaded by a failed connect the core's camera at the retry."""
+    cfg = tmp_path / "two.cfg"
+    cfg.write_text("Device,Camera,DemoCamera,DCam\nDevice,Z,DemoCamera,DStage\n")
+    original = demo_core.initializeDevice
+
+    def failing(label):
+        if label == "Z":
+            raise RuntimeError("boom")
+        original(label)
+
+    monkeypatch.setattr(demo_core, "initializeDevice", failing)
+    scope = MMSystem(cfg, core=demo_core, path_provider=provider(tmp_path))
+    with pytest.raises(RuntimeError, match="boom"):
+        await scope.connect()
+    monkeypatch.undo()
+    await scope.connect(force_reconnect=True)
+    assert demo_core.getCameraDevice() == "Camera"
+
+
+@pytest.mark.demo
 async def test_reconnect_reuses_and_logs(demo_core, tmp_path, caplog):
     """Reuse the devices of an earlier connect and log each at info."""
     scope = MMSystem(

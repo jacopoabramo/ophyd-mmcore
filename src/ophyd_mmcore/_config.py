@@ -101,8 +101,8 @@ def load_config(core: CMMCorePlus, model: Microscope) -> None:
     """Load the devices of `model` into `core` the way `loadSystemConfiguration` does.
 
     A device the core has loaded with the same library and adapter is reused
-    as it is. Core roles that are still empty go to the first new device of
-    their type, and the configuration groups, the pixel size presets and the
+    as it is. Core roles that are still empty go to the first device of their
+    type in the model, and the configuration groups, the pixel size presets and the
     core properties of the model are applied.
 
     Raises
@@ -112,8 +112,9 @@ def load_config(core: CMMCorePlus, model: Microscope) -> None:
         names. Nothing is loaded.
     """
     loaded = set(core.getLoadedDevices())
+    devices = [*model.assigned_com_ports, *model.devices]
     new: list[ModelDevice] = []
-    for device in [*model.assigned_com_ports, *model.devices]:
+    for device in devices:
         if device.name not in loaded:
             new.append(device)
             continue
@@ -151,7 +152,7 @@ def load_config(core: CMMCorePlus, model: Microscope) -> None:
     for role, device_type in CORE_ROLES.items():
         if core.getProperty("Core", role):
             continue
-        for device in new:
+        for device in devices:
             if core.getDeviceType(device.name) == device_type:
                 core.setProperty("Core", role, device.name)
                 break
