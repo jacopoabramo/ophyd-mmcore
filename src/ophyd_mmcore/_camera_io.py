@@ -137,13 +137,12 @@ class Output:
 
 
 class CameraIO:
-    """Sequence flags, cached settings and stores of one camera.
+    """Sequence flags and stores of one camera.
 
     `acquire` runs the camera's sequence and `capture` opens the gate that
     lets frames into the stores, one per physical camera. A setting written
     while the camera acquires is written between a stop and a restart of the
-    sequence, and refused while it captures. While it acquires, a setting
-    reads the value it had when the sequence last started or resumed. A
+    sequence, and refused while it captures. A
     physical camera of the acquiring camera counts as acquiring and
     capturing with it. An output's store cannot be replaced while the camera captures, and clearing
     its `file_path` then closes the gate before the store.
@@ -161,8 +160,6 @@ class CameraIO:
         self.label = label
         self.physical = physical
         self._outputs = {name: Output() for name in physical}
-        self._settings: dict[str, Any] = {}
-        self._getters: dict[str, Callable[[], Any]] = {}
         self._layouts: dict[str, Layout] = {}
         self._values: dict[str, Any] = {
             "acquire": False,
@@ -243,40 +240,25 @@ class CameraIO:
             subscribe=lambda callback: self._ctrl.subscribe(key, callback),
         )
 
-    async def read_setting(self, key: str, get: Callable[[], Any]) -> Any:
-        """Read a setting, from the cache while the camera acquires."""
-        self._getters[key] = get
-        running = self._running
-        if running and key in self._settings:
-            return self._settings[key]
-        value = await self._ctrl.call(get)
-        if not running:
-            self._settings[key] = value
-        return value
-
-    async def write_setting(
-        self, key: str, set_: Callable[[], None], get: Callable[[], Any]
+    async def write_paused(
+        self,
+        what: str,
+        change: Callable[[], None],
+        get: Callable[[], Any] | None = None,
     ) -> Any:
-        """Write a setting, pausing the sequence if one runs, and return its new value.
-
-        Raises
-        ------
-        RuntimeError
-            If the camera is capturing.
-        """
-        return await self._sequence_camera()._serialised(
-            self._change_setting, key, set_, get
-        )
-
-    async def write_paused(self, what: str, change: Callable[[], None]) -> None:
         """Run `change`, pausing the sequence if one runs.
+
+        Returns what `get` reads after the change, before the sequence
+        resumes, or None without a `get`.
 
         Raises
         ------
         RuntimeError
             Naming `what`, if the camera is capturing.
         """
-        await self._sequence_camera()._serialised(self._change_paused, what, change)
+        return await self._sequence_camera()._serialised(
+            self._change_paused, what, change, get
+        )
 
     def deliver(self, physical: str, frame: np.ndarray) -> bool:
         """Append a frame to its output's store while the gate is open.
@@ -361,11 +343,13 @@ class CameraIO:
             return core.getExposure(self.label)
 
         async def read() -> float:
-            return await self.read_setting("exposure", get)
+            return await self._ctrl.call(get)
 
         async def write(value: float) -> None:
-            exposure = await self.write_setting(
-                "exposure", lambda: core.setExposure(self.label, value), get
+            exposure = await self.write_paused(
+                f"exposure of camera {self.label!r}",
+                lambda: core.setExposure(self.label, value),
+                get,
             )
             # UniMMCore emits no exposureChanged for a Python camera.
             self._ctrl._dispatch(key, exposure)
@@ -407,14 +391,6 @@ class CameraIO:
                 raise asyncio.CancelledError
             return task.result()
 
-    async def _change_setting(
-        self, key: str, set_: Callable[[], None], get: Callable[[], Any]
-    ) -> Any:
-        value = await self._change_paused(f"{key} of camera {self.label!r}", set_, get)
-        self._getters[key] = get
-        self._settings[key] = value
-        return value
-
     async def _change_paused(
         self,
         what: str,
@@ -441,7 +417,7 @@ class CameraIO:
                     self._faulted = False
                     self._update(acquire=False)
         if value:
-            await self._ctrl._start_sequence(self.label, self._refresh)
+            await self._ctrl._start_sequence(self.label, self._refresh_layouts)
             with self._lock:
                 self._faulted = False
                 self._update(acquire=True, last_error="")
@@ -527,14 +503,6 @@ class CameraIO:
             )
         return {name: self._layouts[name] for name in self.physical}
 
-    def _refresh(self) -> None:
-        """Read the layouts and cached settings again, with no sequence running."""
-        self._refresh_layouts()
-        for label in {self.label, *self.physical}:
-            if (camera := self._ctrl._cameras.get(label)) is not None:
-                for key, get in list(camera._getters.items()):
-                    camera._settings[key] = get()
-
     def _refresh_layouts(self) -> None:
         """Read every output's layout, making each physical camera current in turn."""
         with self._ctrl._camera_lock:
@@ -582,7 +550,7 @@ class CameraIO:
             try:
                 set_()
                 value = None if get is None else get()
-                self._refresh()
+                self._refresh_layouts()
             finally:
                 core.startSequenceAcquisition(self.label, SEQUENCE_LENGTH, 0, True)
         return value

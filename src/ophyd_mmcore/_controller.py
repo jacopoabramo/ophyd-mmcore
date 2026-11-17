@@ -200,13 +200,13 @@ class MMController:
             return result
 
         async def read() -> Any:
-            if (camera := self._cameras.get(label)) is not None:
-                return await camera.read_setting(prop, get)
             return await self.call(get)
 
         async def write(value: Any) -> None:
             if (camera := self._cameras.get(label)) is not None:
-                await camera.write_setting(prop, lambda: set_(value), get)
+                await camera.write_paused(
+                    f"{prop} of camera {label!r}", lambda: set_(value)
+                )
             else:
                 await self.call(set_, value)
 
@@ -426,6 +426,11 @@ class MMController:
         async def apply(preset: str) -> None:
             def set_config() -> None:
                 self._core.setConfig(group, preset)
+                # The core does not announce every property a preset changes.
+                for device, prop, _ in self._core.getConfigData(group, preset):
+                    self._on_property(
+                        device, prop, self._core.getProperty(device, prop)
+                    )
 
             camera = await self.call(acquiring_camera, preset)
             if camera is None:
