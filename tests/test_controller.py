@@ -150,8 +150,16 @@ async def main():
     await camera.connect()
     await camera.stage()
     await camera.acquire.set(True)
+    # AFTER ACQUIRE
 
 asyncio.run(main())
+"""
+
+REFUSE_CAMERA_SWITCH = """
+    def refuse(label):
+        raise RuntimeError("camera unplugged")
+
+    core.setCameraDevice = refuse
 """
 
 
@@ -164,4 +172,19 @@ def test_exit_stops_a_staged_camera(demo_core, tmp_path):
         [sys.executable, str(script)], capture_output=True, text=True, timeout=60
     )
     assert result.returncode == 0, result.stderr
+    assert result.stdout.split()[-2:] == ["False", "True"]
+
+
+@pytest.mark.demo
+def test_exit_restores_auto_shutter_when_the_camera_cannot_be_restored(
+    demo_core, tmp_path
+):
+    """Restore AutoShutter at exit even when making the earlier camera current fails."""
+    script = tmp_path / "staged.py"
+    script.write_text(EXIT_SCRIPT.replace("    # AFTER ACQUIRE", REFUSE_CAMERA_SWITCH))
+    result = subprocess.run(
+        [sys.executable, str(script)], capture_output=True, text=True, timeout=60
+    )
+    assert result.returncode == 0, result.stderr
+    assert "camera unplugged" in result.stderr
     assert result.stdout.split()[-2:] == ["False", "True"]

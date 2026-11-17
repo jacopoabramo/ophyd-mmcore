@@ -5,6 +5,7 @@ import threading
 import time
 import weakref
 from collections.abc import Awaitable, Callable, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Any, Literal, ParamSpec, TypeVar
 
@@ -531,19 +532,16 @@ class MMController:
             await self.call(self._end_sequence)
 
     def _end_sequence(self) -> None:
-        with self._camera_lock:
+        # The stack runs every step, last added first, even after one raises.
+        with self._camera_lock, ExitStack() as steps:
             restore, self._restore = self._restore, None
-            try:
-                if self._acquiring is not None:
-                    self._core.stopSequenceAcquisition(self._acquiring)
-            finally:
-                try:
-                    self._router.stop()
-                    if restore is not None:
-                        self._core.setCameraDevice(restore[0])
-                        self._core.setAutoShutter(restore[1])
-                finally:
-                    self._acquiring = None
+            steps.callback(setattr, self, "_acquiring", None)
+            if restore is not None:
+                steps.callback(self._core.setAutoShutter, restore[1])
+                steps.callback(self._core.setCameraDevice, restore[0])
+            steps.callback(self._router.stop)
+            if self._acquiring is not None:
+                self._core.stopSequenceAcquisition(self._acquiring)
 
     def _deliver(self, physical: str, frame: np.ndarray) -> None:
         camera = self._cameras.get(self._acquiring or "")
@@ -578,11 +576,16 @@ class MMController:
         """Stop the acquiring camera, close every store and drop every subscription.
 
         The camera and AutoShutter current before the sequence started are
-        restored. Closing again does nothing.
+        restored, and a step that raises does not skip the others. Closing
+        again does nothing.
         """
-        for camera in self._cameras.values():
-            camera.close()
-        self._end_sequence()
+        with ExitStack() as steps:
+            steps.callback(self._drop_subscriptions)
+            steps.callback(self._end_sequence)
+            for camera in self._cameras.values():
+                steps.callback(camera.close)
+
+    def _drop_subscriptions(self) -> None:
         with self._lock:
             self._closed = True
             subscriptions = [s for subs in self._subscriptions.values() for s in subs]
