@@ -150,7 +150,8 @@ class CameraIO:
 
     A frame that cannot be written, or frames lost because the core's
     circular buffer overflowed, stop the sequence and fault the camera with
-    the error as `last_error`, until `acquire` is set to true again.
+    the error as `last_error`. Writing `acquire` clears the fault, and
+    `last_error` keeps the error until `acquire` is set to true again.
     """
 
     def __init__(
@@ -412,6 +413,7 @@ class CameraIO:
                 await self._ctrl._stop_sequence(self.label)
             finally:
                 with self._lock:
+                    self._faulted = False
                     self._update(acquire=False)
         if value:
             await self._ctrl._start_sequence(self.label, self._refresh_layouts)

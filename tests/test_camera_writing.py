@@ -293,3 +293,18 @@ async def test_cancelled_change_logs_its_error(cam, uni_core, monkeypatch, caplo
     with caplog.at_level(logging.ERROR), pytest.raises(asyncio.CancelledError):
         await status
     assert "camera unplugged" in caplog.text
+
+
+async def test_run_after_a_faulted_run_triggers(cam, monkeypatch):
+    """Clear a fault at unstage, so that the next run takes its collection."""
+    await cam.stage()
+    with monkeypatch.context() as patch:
+        patch.setattr("ophyd_mmcore._camera_io.FrameStore.append", raising_append)
+        with pytest.raises(RuntimeError, match="disk full"):
+            await cam.trigger()
+    await cam.unstage()
+    assert await cam.state.get_value() == CameraState.IDLE
+    assert "disk full" in await cam.last_error.get_value()
+    await cam.stage()
+    await cam.trigger()
+    await cam.unstage()
