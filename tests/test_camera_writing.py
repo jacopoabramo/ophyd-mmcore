@@ -18,7 +18,7 @@ from ophyd_async.testing import MonitorQueue
 from pymmcore_plus import CMMCorePlus
 from pymmcore_plus.experimental.unicore import UniMMCore
 
-from ophyd_mmcore import CameraState, MMCamera
+from ophyd_mmcore import CameraState, MMCamera, MMConfigGroup
 
 
 async def connected_camera(
@@ -324,3 +324,27 @@ async def test_setting_changed_on_the_core_is_read_while_acquiring(cam, uni_core
     uni_core.setExposure("Cam", 42.0)
     await cam.acquire.set(True)
     assert await cam.exposure.get_value() == 42.0
+
+
+@pytest.fixture
+async def gains(uni_core: UniMMCore) -> MMConfigGroup:
+    """Return the group `Gains`, whose preset `High` sets the gain of `Cam` to 4."""
+    uni_core.defineConfig("Gains", "High", "Cam", "Gain", "4")
+    group = MMConfigGroup("Gains", uni_core, name="gains")
+    await group.connect()
+    return group
+
+
+async def test_preset_of_an_acquiring_camera_pauses_its_sequence(cam, gains, uni_core):
+    """Apply a preset that sets a property the adapter refuses mid-sequence."""
+    await cam.acquire.set(True)
+    await gains.set("High")
+    assert await cam.properties["gain"].get_value() == 4
+    assert uni_core.isSequenceRunning("Cam")
+
+
+async def test_preset_of_a_capturing_camera_is_refused(cam, gains, tmp_path):
+    """Refuse a preset that sets a property of a camera during its capture."""
+    await start_capture(cam, tmp_path / "a.zarr", 0)
+    with pytest.raises(RuntimeError, match="Gains"):
+        await gains.set("High")

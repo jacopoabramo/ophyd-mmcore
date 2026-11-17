@@ -268,6 +268,16 @@ class CameraIO:
             self._change_setting, key, set_, get
         )
 
+    async def write_paused(self, what: str, change: Callable[[], None]) -> None:
+        """Run `change`, pausing the sequence if one runs.
+
+        Raises
+        ------
+        RuntimeError
+            Naming `what`, if the camera is capturing.
+        """
+        await self._sequence_camera()._serialised(self._change_paused, what, change)
+
     def deliver(self, physical: str, frame: np.ndarray) -> bool:
         """Append a frame to its output's store while the gate is open.
 
@@ -400,16 +410,23 @@ class CameraIO:
     async def _change_setting(
         self, key: str, set_: Callable[[], None], get: Callable[[], Any]
     ) -> Any:
-        camera = self._sequence_camera()
-        if camera._values["capture"]:
-            raise RuntimeError(
-                f"Cannot change {key} of camera {self.label!r} while camera "
-                f"{camera.label!r} captures"
-            )
-        value = await self._ctrl.call(camera._write_paused, set_, get, self._running)
+        value = await self._change_paused(f"{key} of camera {self.label!r}", set_, get)
         self._getters[key] = get
         self._settings[key] = value
         return value
+
+    async def _change_paused(
+        self,
+        what: str,
+        set_: Callable[[], None],
+        get: Callable[[], Any] | None = None,
+    ) -> Any:
+        camera = self._sequence_camera()
+        if camera._values["capture"]:
+            raise RuntimeError(
+                f"Cannot change {what} while camera {camera.label!r} captures"
+            )
+        return await self._ctrl.call(camera._write_paused, set_, get, self._running)
 
     async def _change_acquire(self, value: bool) -> None:
         if self._values["acquire"]:
@@ -552,11 +569,11 @@ class CameraIO:
                     core.setCameraDevice(current)
 
     def _write_paused(
-        self, set_: Callable[[], None], get: Callable[[], Any], pause: bool
+        self, set_: Callable[[], None], get: Callable[[], Any] | None, pause: bool
     ) -> Any:
         if not pause:
             set_()
-            return get()
+            return None if get is None else get()
         core = self._ctrl.core
         # Held across the pause, so that it is not taken for a sequence that
         # stopped on its own.
@@ -564,7 +581,7 @@ class CameraIO:
             core.stopSequenceAcquisition(self.label)
             try:
                 set_()
-                value = get()
+                value = None if get is None else get()
                 self._refresh()
             finally:
                 core.startSequenceAcquisition(self.label, SEQUENCE_LENGTH, 0, True)

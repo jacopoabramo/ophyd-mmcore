@@ -255,7 +255,7 @@ class MMController:
             return self._targets[label, axis]
 
         async def store_and_move(value: float, move: Callable[[], None]) -> None:
-            await self._store_and_move((label, axis), value, move)
+            await self._store_and_move((label, axis), value, lambda: self.call(move))
 
         async def write(value: float) -> None:
             if axis == "z":
@@ -298,12 +298,12 @@ class MMController:
         )
 
     async def _store_and_move(
-        self, key: tuple[str, str], value: Any, move: Callable[[], None]
+        self, key: tuple[str, str], value: Any, move: Callable[[], Awaitable[None]]
     ) -> None:
         previous = self._targets.get(key)
         self._targets[key] = value
         try:
-            await self.call(move)
+            await move()
         except Exception:
             if previous is None:
                 del self._targets[key]
@@ -316,7 +316,7 @@ class MMController:
         uri: str,
         key: tuple[str, str],
         get: Callable[[], T],
-        move: Callable[[T], None],
+        move: Callable[[T], Awaitable[None]],
         wait: Callable[[T], None],
         events: dict[EventKey, Callable[[Any], T] | None],
         metadata: Callable[[], SignalMetadata] | None = None,
@@ -377,7 +377,7 @@ class MMController:
             f"mmcore://{label}/open",
             (label, "open"),
             lambda: self._core.getShutterOpen(label),
-            lambda value: self._core.setShutterOpen(label, value),
+            lambda value: self.call(self._core.setShutterOpen, label, value),
             lambda value: self._core.waitForDevice(label),
             {
                 (label, "core:open"): None,
@@ -396,7 +396,7 @@ class MMController:
             f"mmcore://{label}/Label",
             (label, "state"),
             lambda: self._core.getStateLabel(label),
-            lambda value: self._core.setStateLabel(label, value),
+            lambda value: self.call(self._core.setStateLabel, label, value),
             lambda value: self._core.waitForDevice(label),
             {(label, "Label"): None},
             lambda: SignalMetadata(choices=list(self._core.getStateLabels(label))),
@@ -409,12 +409,37 @@ class MMController:
         idle. Reading gives `""` when no preset matches the hardware. The
         presets of the group are the `choices` of its metadata. `setpoint`
         behaves as it does for [`shutter_source`][ophyd_mmcore._controller.MMController.shutter_source].
+        A preset that sets a property of the acquiring camera, or of one of
+        its physical cameras, is applied between a stop and a restart of the
+        sequence, and refused while that camera captures.
         """
+
+        def acquiring_camera(preset: str) -> CameraIO | None:
+            camera = self._cameras.get(self._acquiring or "")
+            if camera is None:
+                return None
+            devices = {
+                setting[0] for setting in self._core.getConfigData(group, preset)
+            }
+            return camera if devices & {camera.label, *camera.physical} else None
+
+        async def apply(preset: str) -> None:
+            def set_config() -> None:
+                self._core.setConfig(group, preset)
+
+            camera = await self.call(acquiring_camera, preset)
+            if camera is None:
+                await self.call(set_config)
+            else:
+                await camera.write_paused(
+                    f"preset {preset!r} of group {group!r}", set_config
+                )
+
         return self._moving_source(
             f"mmcore://{group}/preset",
             (group, "preset"),
             lambda: self._core.getCurrentConfig(group),
-            lambda value: self._core.setConfig(group, value),
+            apply,
             lambda value: self._core.waitForConfig(group, value),
             {(group, "core:preset"): None},
             lambda: SignalMetadata(choices=list(self._core.getAvailableConfigs(group))),
