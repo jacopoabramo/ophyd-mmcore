@@ -488,7 +488,7 @@ class MMController:
             self._core.setAutoShutter(False)
             try:
                 prepare()
-                self._core.startSequenceAcquisition(label, SEQUENCE_LENGTH, 0, False)
+                self._core.startSequenceAcquisition(label, SEQUENCE_LENGTH, 0, True)
             except Exception:
                 self._restore = None
                 self._core.setCameraDevice(restore[0])

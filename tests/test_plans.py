@@ -1,5 +1,6 @@
 """End-to-end plans on the Micro-Manager demo adapters."""
 
+import time
 from collections import defaultdict
 from typing import cast
 from urllib.parse import urlparse
@@ -15,10 +16,11 @@ from ophyd_async.core import (
     StaticPathProvider,
     TriggerInfo,
     UUIDFilenameProvider,
+    wait_for_value,
 )
 from ophyd_async.plan_stubs import ensure_connected
 
-from ophyd_mmcore import MMCamera, MMSystem
+from ophyd_mmcore import CameraState, MMCamera, MMSystem
 
 pytestmark = pytest.mark.demo
 
@@ -174,3 +176,35 @@ async def test_physical_camera_write_pauses_the_multi_camera(multi_core, tmp_pat
         assert multi_core.isSequenceRunning("Multi")
     finally:
         await multi.acquire.set(False)
+
+
+def slow_append(self, frame) -> None:
+    time.sleep(0.05)
+
+
+async def test_buffer_overflow_faults_the_camera(
+    demo_loaded_core, monkeypatch, tmp_path
+):
+    """Fault the camera when frames arrive faster than they are written."""
+    monkeypatch.setattr("ophyd_mmcore._camera_io.FrameStore.append", slow_append)
+    demo_loaded_core.setCircularBufferMemoryFootprint(2)
+    demo_loaded_core.setExposure(1)
+    cam = MMCamera(
+        "Camera",
+        demo_loaded_core,
+        path_provider=StaticPathProvider(UUIDFilenameProvider(), tmp_path),
+        name="cam",
+    )
+    await cam.connect()
+    out = cam.outputs["camera"]
+    await out.file_path.set(str(tmp_path / "a.zarr"))
+    await out.data_key.set("cam")
+    await cam.acquire.set(True)
+    try:
+        await cam.capture.set(True)
+        await wait_for_value(cam.state, CameraState.FAULTED, timeout=5)
+        assert "overflowed" in await cam.last_error.get_value()
+    finally:
+        await cam.capture.set(False)
+        await cam.acquire.set(False)
+        await out.file_path.set("")

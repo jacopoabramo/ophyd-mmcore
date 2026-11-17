@@ -556,7 +556,7 @@ class CameraIO:
                 value = get()
                 self._refresh_layouts()
             finally:
-                core.startSequenceAcquisition(self.label, SEQUENCE_LENGTH, 0, False)
+                core.startSequenceAcquisition(self.label, SEQUENCE_LENGTH, 0, True)
         return value
 
     def _open_gate(self) -> None:
