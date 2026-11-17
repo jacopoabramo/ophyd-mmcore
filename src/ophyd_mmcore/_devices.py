@@ -4,6 +4,7 @@ from functools import cached_property
 from typing import TYPE_CHECKING, ClassVar, Literal
 from typing import Annotated as A
 
+from bluesky.protocols import Location
 from ophyd_async.core import (
     DeviceMap,
     MovableLogic,
@@ -27,7 +28,6 @@ from ._connector import (
 )
 
 if TYPE_CHECKING:
-    from bluesky.protocols import Location
     from pymmcore_plus import CMMCorePlus
 
 
@@ -125,7 +125,7 @@ class MMMoveLogic(MovableLogic[SignalDatatypeT]):
 class MMMovable(StandardMovable[SignalDatatypeT]):
     """A device that moves through [`MMMoveLogic`][ophyd_mmcore._devices.MMMoveLogic]."""
 
-    async def locate(self) -> "Location[SignalDatatypeT]":
+    async def locate(self) -> Location[SignalDatatypeT]:
         """Return the stored target as the setpoint and the hardware value as the readback."""
         return await self.movable_logic.setpoint.locate()
 

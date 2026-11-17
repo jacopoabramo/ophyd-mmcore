@@ -9,12 +9,11 @@ from typing import TYPE_CHECKING, Any, Final, Literal, TypeVar
 
 import acquire_zarr as az
 import numpy as np
+from ophyd_async.core import SignalMetadata
 
 from ._backend import CameraState, MMSource
 
 if TYPE_CHECKING:
-    from ophyd_async.core import SignalMetadata
-
     from ._controller import MMController
 
 SEQUENCE_LENGTH: Final = 2**31 - 1
@@ -353,8 +352,8 @@ class CameraIO:
             # UniMMCore emits no exposureChanged for a Python camera.
             self._ctrl._dispatch(key, exposure)
 
-        async def metadata() -> "SignalMetadata":
-            return {"units": "ms"}
+        async def metadata() -> SignalMetadata:
+            return SignalMetadata(units="ms")
 
         return MMSource(
             uri=f"mmcore://{self.label}/exposure",

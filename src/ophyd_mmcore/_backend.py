@@ -3,22 +3,20 @@ import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Generic, TypeVar
+from typing import Any, Generic, TypeVar
 
+from bluesky.protocols import Location, Reading
+from event_model import DataKey
 from ophyd_async.core import (
     NO_ARG_VOID_SIGNATURE,
     Callback,
     CommandBackend,
     SignalBackend,
     SignalDatatypeT,
+    SignalMetadata,
     StrictEnum,
     make_datakey,
 )
-
-if TYPE_CHECKING:
-    from bluesky.protocols import Location, Reading
-    from event_model import DataKey
-    from ophyd_async.core import SignalMetadata
 
 T = TypeVar("T")
 
@@ -48,7 +46,7 @@ class MMSource(Generic[T]):
     setpoint: Callable[[], Awaitable[T]] | None = None
     subscribe: Callable[[Callable[[T, float], None]], Callable[[], None]] | None = None
     infer: Callable[[], Awaitable[type[T]]] | None = None
-    metadata: "Callable[[], Awaitable[SignalMetadata]] | None" = None
+    metadata: Callable[[], Awaitable[SignalMetadata]] | None = None
 
 
 class MMSignalBackend(SignalBackend[SignalDatatypeT]):
@@ -106,35 +104,31 @@ class MMSignalBackend(SignalBackend[SignalDatatypeT]):
             raise RuntimeError(f"{source.uri} has no default value to write")
         await source.write(value)
 
-    async def get_datakey(self, source: str) -> "DataKey":
+    async def get_datakey(self, source: str) -> DataKey:
         bound = self._bound()
-        metadata: SignalMetadata = (
-            {} if bound.metadata is None else await bound.metadata()
+        metadata = (
+            SignalMetadata() if bound.metadata is None else await bound.metadata()
         )
         value = await self.get_value()
         return make_datakey(self.datatype or type(value), value, source, metadata)
 
-    async def get_reading(self) -> "Reading[SignalDatatypeT]":
-        return {
-            "value": await self.get_value(),
-            "timestamp": time.time(),
-            "alarm_severity": 0,
-        }
+    async def get_reading(self) -> Reading[SignalDatatypeT]:
+        return Reading(
+            value=await self.get_value(), timestamp=time.time(), alarm_severity=0
+        )
 
     async def get_value(self) -> SignalDatatypeT:
         return self._convert(await self._bound().read())
 
-    async def get_location(self) -> "Location[SignalDatatypeT]":
+    async def get_location(self) -> Location[SignalDatatypeT]:
         source = self._bound()
         readback = await self.get_value()
         if source.setpoint is None:
-            return {"setpoint": readback, "readback": readback}
+            return Location(setpoint=readback, readback=readback)
         setpoint = self._convert(await source.setpoint())
-        return {"setpoint": setpoint, "readback": readback}
+        return Location(setpoint=setpoint, readback=readback)
 
-    def set_callback(
-        self, callback: "Callback[Reading[SignalDatatypeT]] | None"
-    ) -> None:
+    def set_callback(self, callback: Callback[Reading[SignalDatatypeT]] | None) -> None:
         if callback is None:
             self._stop()
             return
@@ -147,11 +141,9 @@ class MMSignalBackend(SignalBackend[SignalDatatypeT]):
             nonlocal event_seen
             event_seen = True
             callback(
-                {
-                    "value": self._convert(value),
-                    "timestamp": timestamp,
-                    "alarm_severity": 0,
-                }
+                Reading(
+                    value=self._convert(value), timestamp=timestamp, alarm_severity=0
+                )
             )
 
         async def deliver_current() -> None:
