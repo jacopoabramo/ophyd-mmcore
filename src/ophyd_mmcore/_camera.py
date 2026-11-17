@@ -179,7 +179,8 @@ class MMCamera(StandardDetector):
     ------
     ValueError
         If both or neither of `core` and `connector` are given, if options are
-        given with a `connector`, or if there is no path provider.
+        given with a `connector`, if there is no path provider, or if two
+        physical cameras have the same cleaned name.
     """
 
     exposure: A[SignalRW[float], CameraValue("exposure")]
@@ -228,11 +229,14 @@ class MMCamera(StandardDetector):
         super().__init__(name=name, connector=connector)
         outputs: dict[str, MMCameraOutput] = {}
         for physical_label in connector.physical or (connector.label,):
+            key = clean_name(physical_label)
+            if key in outputs:
+                raise ValueError(
+                    f"Two physical cameras of {connector.label!r} both become {key!r}"
+                )
             output_connector = connector.child()
             output_connector.set_address(output=physical_label)
-            outputs[clean_name(physical_label)] = MMCameraOutput(
-                connector=output_connector
-            )
+            outputs[key] = MMCameraOutput(connector=output_connector)
         self.outputs = DeviceMap(outputs)
         self.properties = property_map(connector)
         self.add_config_signals(*self.properties.values())

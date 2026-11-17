@@ -186,3 +186,14 @@ def test_system_camera_needs_path_provider(bare_core):
     """Refuse a declared camera when its system has no path provider."""
     with pytest.raises(ValueError, match="Cam"):
         Rig(bare_core)
+
+
+def test_physical_cameras_with_one_cleaned_name_are_refused(bare_core, tmp_path):
+    """Refuse two physical cameras whose labels would share one output key."""
+    with pytest.raises(ValueError, match="cam_1"):
+        MMCamera(
+            "Multi",
+            bare_core,
+            path_provider=StaticPathProvider(UUIDFilenameProvider(), tmp_path),
+            physical=("Cam-1", "Cam 1"),
+        )
