@@ -113,7 +113,9 @@ class MMController:
         self._cameras: dict[str, CameraIO] = {}
         self._acquiring: str | None = None
         self._restore: tuple[str, bool] | None = None
-        self._router = FrameRouter(core, self._deliver, self._on_overflow)
+        self._router = FrameRouter(
+            core, self._deliver, self._on_overflow, self._check_sequence
+        )
         self._dropped: set[str] = set()
         events = core.events
         self._connections: list[tuple[Any, Callable[..., None]]] = [
@@ -526,6 +528,21 @@ class MMController:
                 f"Frames of camera {camera.label!r} were lost because the "
                 "circular buffer overflowed"
             )
+
+    def _check_sequence(self) -> None:
+        """Fault the acquiring camera if its sequence stopped on its own."""
+        # The lock is held while a sequence starts, pauses or stops, and the
+        # thread that stops one waits for this thread, so the check is skipped.
+        if not self._camera_lock.acquire(blocking=False):
+            return
+        try:
+            label = self._acquiring
+            if label is None or self._core.isSequenceRunning(label):
+                return
+        finally:
+            self._camera_lock.release()
+        if (camera := self._cameras.get(label)) is not None:
+            camera.fault(f"The sequence of camera {label!r} stopped on its own")
 
     def close(self) -> None:
         """Stop the acquiring camera, close every store and drop every subscription.

@@ -308,3 +308,11 @@ async def test_run_after_a_faulted_run_triggers(cam, monkeypatch):
     await cam.stage()
     await cam.trigger()
     await cam.unstage()
+
+
+async def test_sequence_stopped_by_other_code_faults_the_camera(cam, uni_core):
+    """Fault the camera when its sequence stops without the camera stopping it."""
+    await cam.acquire.set(True)
+    uni_core.stopSequenceAcquisition("Cam")
+    await wait_for_value(cam.state, CameraState.FAULTED, timeout=5)
+    assert "stopped" in await cam.last_error.get_value()

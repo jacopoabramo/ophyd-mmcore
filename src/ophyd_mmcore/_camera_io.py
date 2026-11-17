@@ -148,9 +148,9 @@ class CameraIO:
     capturing with it. An output's store cannot be replaced while the camera captures, and clearing
     its `file_path` then closes the gate before the store.
 
-    A frame that cannot be written, or frames lost because the core's
-    circular buffer overflowed, stop the sequence and fault the camera with
-    the error as `last_error`. Writing `acquire` clears the fault, and
+    A frame that cannot be written, frames lost because the core's circular
+    buffer overflowed, or a sequence that stopped on its own, stop the
+    sequence and fault the camera with the error as `last_error`. Writing `acquire` clears the fault, and
     `last_error` keeps the error until `acquire` is set to true again.
     """
 
@@ -301,8 +301,13 @@ class CameraIO:
         return True
 
     def fault(self, error: str) -> None:
-        """Close the gate, stop the sequence and fault the camera with `error`."""
+        """Close the gate, stop the sequence and fault the camera with `error`.
+
+        A camera that is already faulted keeps its first error.
+        """
         with self._lock:
+            if self._faulted:
+                return
             self._faulted = True
             self._update(capture=False, last_error=error)
         self._ctrl.core.stopSequenceAcquisition(self.label)
@@ -542,13 +547,16 @@ class CameraIO:
             set_()
             return get()
         core = self._ctrl.core
-        core.stopSequenceAcquisition(self.label)
-        try:
-            set_()
-            value = get()
-            self._refresh_layouts()
-        finally:
-            core.startSequenceAcquisition(self.label, SEQUENCE_LENGTH, 0, False)
+        # Held across the pause, so that it is not taken for a sequence that
+        # stopped on its own.
+        with self._ctrl._camera_lock:
+            core.stopSequenceAcquisition(self.label)
+            try:
+                set_()
+                value = get()
+                self._refresh_layouts()
+            finally:
+                core.startSequenceAcquisition(self.label, SEQUENCE_LENGTH, 0, False)
         return value
 
     def _open_gate(self) -> None:
