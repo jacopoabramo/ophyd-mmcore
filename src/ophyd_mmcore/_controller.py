@@ -5,6 +5,7 @@ import threading
 import time
 import weakref
 from collections.abc import Awaitable, Callable, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Any, Literal, ParamSpec, TypeVar
 
@@ -18,6 +19,9 @@ from ._camera_io import SEQUENCE_LENGTH, CameraIO
 from ._frames import FrameRouter
 
 logger = logging.getLogger(__name__)
+
+EXPOSURE_PROPERTY = "Exposure"
+"""The property through which a Micro-Manager camera also takes its exposure."""
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -114,7 +118,11 @@ class MMController:
         self._acquiring: str | None = None
         self._restore: tuple[str, bool] | None = None
         self._router = FrameRouter(
-            core, self._deliver, self._on_overflow, self._check_sequence
+            core,
+            self._deliver,
+            self._on_overflow,
+            self._check_sequence,
+            self._on_routing_failure,
         )
         self._dropped: set[str] = set()
         events = core.events
@@ -531,19 +539,16 @@ class MMController:
             await self.call(self._end_sequence)
 
     def _end_sequence(self) -> None:
-        with self._camera_lock:
+        # The stack runs every step, last added first, even after one raises.
+        with self._camera_lock, ExitStack() as steps:
             restore, self._restore = self._restore, None
-            try:
-                if self._acquiring is not None:
-                    self._core.stopSequenceAcquisition(self._acquiring)
-            finally:
-                try:
-                    self._router.stop()
-                    if restore is not None:
-                        self._core.setCameraDevice(restore[0])
-                        self._core.setAutoShutter(restore[1])
-                finally:
-                    self._acquiring = None
+            steps.callback(setattr, self, "_acquiring", None)
+            if restore is not None:
+                steps.callback(self._core.setAutoShutter, restore[1])
+                steps.callback(self._core.setCameraDevice, restore[0])
+            steps.callback(self._router.stop)
+            if self._acquiring is not None:
+                self._core.stopSequenceAcquisition(self._acquiring)
 
     def _deliver(self, physical: str, frame: np.ndarray) -> None:
         camera = self._cameras.get(self._acquiring or "")
@@ -557,6 +562,12 @@ class MMController:
             camera.fault(
                 f"Frames of camera {camera.label!r} were lost because the "
                 "circular buffer overflowed"
+            )
+
+    def _on_routing_failure(self, error: Exception) -> None:
+        if (camera := self._cameras.get(self._acquiring or "")) is not None:
+            camera.fault(
+                f"The frames of camera {camera.label!r} could not be routed: {error!r}"
             )
 
     def _check_sequence(self) -> None:
@@ -578,11 +589,16 @@ class MMController:
         """Stop the acquiring camera, close every store and drop every subscription.
 
         The camera and AutoShutter current before the sequence started are
-        restored. Closing again does nothing.
+        restored, and a step that raises does not skip the others. Closing
+        again does nothing.
         """
-        for camera in self._cameras.values():
-            camera.close()
-        self._end_sequence()
+        with ExitStack() as steps:
+            steps.callback(self._drop_subscriptions)
+            steps.callback(self._end_sequence)
+            for camera in self._cameras.values():
+                steps.callback(camera.close)
+
+    def _drop_subscriptions(self) -> None:
         with self._lock:
             self._closed = True
             subscriptions = [s for subs in self._subscriptions.values() for s in subs]
@@ -601,6 +617,10 @@ class MMController:
 
     def _on_property(self, label: str, prop: str, value: Any) -> None:
         self._dispatch((label, prop), value)
+        # The core announces an exposure set through the property only as a
+        # property, and one set with setExposure only as an exposure.
+        if prop == EXPOSURE_PROPERTY and label in self._cameras:
+            self._dispatch((label, "core:exposure"), float(value))
 
     def _on_stage_position(self, label: str, position: float) -> None:
         self._dispatch((label, "core:position"), position)
@@ -611,6 +631,7 @@ class MMController:
 
     def _on_exposure(self, label: str, exposure: float) -> None:
         self._dispatch((label, "core:exposure"), exposure)
+        self._dispatch((label, EXPOSURE_PROPERTY), exposure)
 
     def _on_shutter(self, label: str, is_open: bool) -> None:
         self._dispatch((label, "core:open"), is_open)

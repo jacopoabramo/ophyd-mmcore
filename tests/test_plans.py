@@ -257,3 +257,26 @@ async def test_staged_camera_follows_a_preset_the_core_does_not_announce(
         await wait_for_value(cam.properties["bit_depth"], 10, timeout=5)
     finally:
         await cam.unstage()
+
+
+async def test_exposure_signal_and_property_follow_each_other(
+    demo_loaded_core, tmp_path
+):
+    """Report an exposure set through the `Exposure` property, and the reverse."""
+    cam = MMCamera(
+        "Camera",
+        demo_loaded_core,
+        path_provider=StaticPathProvider(UUIDFilenameProvider(), tmp_path),
+        properties=["Exposure"],
+        name="cam",
+    )
+    await cam.connect()
+    await cam.stage()
+    try:
+        await cam.trigger()
+        demo_loaded_core.setProperty("Camera", "Exposure", 44.0)
+        await wait_for_value(cam.exposure, 44.0, timeout=5)
+        demo_loaded_core.setExposure(45.0)
+        await wait_for_value(cam.properties["exposure"], 45.0, timeout=5)
+    finally:
+        await cam.unstage()

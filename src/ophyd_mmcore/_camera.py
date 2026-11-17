@@ -78,8 +78,13 @@ class MMTriggerLogic(DetectorTriggerLogic):
         await self.num_capture.set(num)
 
     async def default_trigger_info(self) -> TriggerInfo:
-        """Return the trigger info of one event, which a step scan triggers."""
-        return TriggerInfo()
+        """Return the trigger info of one event, which a step scan triggers.
+
+        The exposure is left as it is, and its length is added to the time a
+        frame may take to arrive.
+        """
+        timeout = await self.exposure.get_value() / 1000 + DEFAULT_TIMEOUT
+        return TriggerInfo(exposure_timeout=timeout, collection_timeout=timeout)
 
 
 @dataclass
@@ -179,7 +184,8 @@ class MMCamera(StandardDetector):
     ------
     ValueError
         If both or neither of `core` and `connector` are given, if options are
-        given with a `connector`, or if there is no path provider.
+        given with a `connector`, if there is no path provider, or if two
+        physical cameras have the same cleaned name.
     """
 
     exposure: A[SignalRW[float], CameraValue("exposure")]
@@ -228,11 +234,14 @@ class MMCamera(StandardDetector):
         super().__init__(name=name, connector=connector)
         outputs: dict[str, MMCameraOutput] = {}
         for physical_label in connector.physical or (connector.label,):
+            key = clean_name(physical_label)
+            if key in outputs:
+                raise ValueError(
+                    f"Two physical cameras of {connector.label!r} both become {key!r}"
+                )
             output_connector = connector.child()
             output_connector.set_address(output=physical_label)
-            outputs[clean_name(physical_label)] = MMCameraOutput(
-                connector=output_connector
-            )
+            outputs[key] = MMCameraOutput(connector=output_connector)
         self.outputs = DeviceMap(outputs)
         self.properties = property_map(connector)
         self.add_config_signals(*self.properties.values())
@@ -316,6 +325,9 @@ class MMCamera(StandardDetector):
     @WatchableAsyncStatus.wrap
     async def trigger(self) -> AsyncIterator[WatcherUpdate[int]]:
         """Take one collection, failing with the camera's last error if it faults."""
+        # The base method prepares with a timeout that ignores the exposure.
+        if self._prepare_ctx is None and self._trigger_logic is not None:
+            await self.prepare(await self._trigger_logic.default_trigger_info())
         async for update in self._raise_on_fault(
             inspect.unwrap(StandardDetector.trigger)(self)
         ):

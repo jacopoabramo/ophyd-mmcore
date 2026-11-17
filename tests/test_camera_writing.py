@@ -340,3 +340,24 @@ async def test_preset_of_a_capturing_camera_is_refused(cam, gains, tmp_path):
     await start_capture(cam, tmp_path / "a.zarr", 0)
     with pytest.raises(RuntimeError, match="Gains"):
         await gains.set("High")
+
+
+async def test_frames_that_cannot_be_routed_fault_the_camera(
+    cam, uni_core, monkeypatch, tmp_path
+):
+    """Fault the camera when its frames keep failing on the way to a store."""
+    pop = uni_core.popNextImageAndMD
+    monkeypatch.setattr(uni_core, "popNextImageAndMD", lambda: (pop()[0], {}))
+    await start_capture(cam, tmp_path / "a.zarr", 1)
+    await wait_for_value(cam.state, CameraState.FAULTED, timeout=5)
+    assert "routed" in await cam.last_error.get_value()
+
+
+async def test_trigger_waits_for_an_exposure_longer_than_the_timeout(cam, monkeypatch):
+    """Give a trigger with no prepare the camera's exposure on top of the timeout."""
+    monkeypatch.setattr("ophyd_async.core._detector.DEFAULT_TIMEOUT", 1.0)
+    monkeypatch.setattr("ophyd_mmcore._camera.DEFAULT_TIMEOUT", 1.0)
+    await cam.exposure.set(1500.0)
+    await cam.stage()
+    await cam.trigger()
+    await cam.unstage()
